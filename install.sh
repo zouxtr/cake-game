@@ -1,19 +1,22 @@
 #!/bin/sh
-# Caketris installer — installs the game to ~/.local/bin/caketris
+# Cake arcade installer — installs caketris, cakeman and the cake-game picker
 # Usage: curl -fsSL https://raw.githubusercontent.com/zouxtr/cake-game/main/install.sh | bash
 set -e
 
 REPO="zouxtr/cake-game"
 BRANCH="main"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-TARGET="$BIN_DIR/caketris"
 
-echo "==> Installing caketris to $TARGET"
+echo "==> Installing cake arcade to $BIN_DIR"
 mkdir -p "$BIN_DIR"
-curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/caketris" -o "$TARGET"
-chmod +x "$TARGET"
+for game in caketris cakeman cake-game; do
+  curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/$game" -o "$BIN_DIR/$game"
+  chmod +x "$BIN_DIR/$game"
+  echo "    installed $game"
+done
 
-echo "==> Done! Run it with: caketris"
+echo "==> Done! Run 'cake-game' to pick a game,"
+echo "    or launch 'caketris' / 'cakeman' directly."
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)

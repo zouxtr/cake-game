@@ -73,6 +73,50 @@ _GRAVITY_CACHE: dict[int, float] = {1: 0.8, 2: 0.72, 3: 0.63, 4: 0.55,
 LINE_SCORES = {0: 0, 1: 100, 2: 300, 3: 500, 4: 800}
 
 HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".caketris_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".caketris_settings.json")
+
+# Piece skins (how blocks look) and color themes (board palette).
+TETRIS_SKINS = ["Solid", "Outline", "Letters", "Dots"]
+TETRIS_THEMES = ["Classic", "Candy", "Ocean", "Sunset"]
+# theme -> piece letter -> curses color name
+THEME_COLORS: dict[str, dict[str, str]] = {
+    "Classic": {"I": "CYAN", "O": "YELLOW", "T": "MAGENTA", "S": "GREEN",
+                "Z": "RED", "J": "BLUE", "L": "WHITE"},
+    "Candy": {"I": "MAGENTA", "O": "CYAN", "T": "YELLOW", "S": "RED",
+              "Z": "GREEN", "J": "WHITE", "L": "BLUE"},
+    "Ocean": {"I": "CYAN", "O": "WHITE", "T": "BLUE", "S": "GREEN",
+              "Z": "CYAN", "J": "GREEN", "L": "WHITE"},
+    "Sunset": {"I": "RED", "O": "YELLOW", "T": "MAGENTA", "S": "WHITE",
+               "Z": "RED", "J": "YELLOW", "L": "MAGENTA"},
+}
+
+
+def load_settings() -> dict:
+    defaults = {"ghost": True, "mono": False, "next": VISIBLE_NEXT,
+                "skin": "Solid", "theme": "Classic"}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in defaults.items():
+            if k in data:
+                defaults[k] = data[k]
+        if defaults["skin"] not in TETRIS_SKINS:
+            defaults["skin"] = "Solid"
+        if defaults["theme"] not in TETRIS_THEMES:
+            defaults["theme"] = "Classic"
+        defaults["next"] = min(5, max(1, int(defaults.get("next", 5))))
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(ghost: bool, mono: bool, nxt: int, skin: str, theme: str) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ghost": ghost, "mono": mono, "next": nxt,
+                       "skin": skin, "theme": theme}, f)
+    except Exception:
+        pass
 
 # Piece colors -> curses color index (mapped later). 1..7
 PIECE_IDS = {"I": 1, "O": 2, "T": 3, "S": 4, "Z": 5, "J": 6, "L": 7}
@@ -457,22 +501,27 @@ def save_highscore(score: int) -> None:
 
 CELL_W = 2  # each board cell is 2 terminal columns wide ("  ")
 
-def _init_colors() -> dict[str, int]:
+def _init_colors(theme: str = "Classic") -> dict[str, int]:
     import curses
     curses.start_color()
     try:
         curses.use_default_colors()
     except Exception:
         pass
+    _color = {"BLACK": curses.COLOR_BLACK, "RED": curses.COLOR_RED,
+              "GREEN": curses.COLOR_GREEN, "YELLOW": curses.COLOR_YELLOW,
+              "BLUE": curses.COLOR_BLUE, "MAGENTA": curses.COLOR_MAGENTA,
+              "CYAN": curses.COLOR_CYAN, "WHITE": curses.COLOR_WHITE}
+    pal = THEME_COLORS.get(theme, THEME_COLORS["Classic"])
     # pair id -> (fg, bg)
     defs = {
-        1: (curses.COLOR_CYAN, -1),     # I
-        2: (curses.COLOR_YELLOW, -1),   # O
-        3: (curses.COLOR_MAGENTA, -1),  # T
-        4: (curses.COLOR_GREEN, -1),    # S
-        5: (curses.COLOR_RED, -1),      # Z
-        6: (curses.COLOR_BLUE, -1),     # J
-        7: (curses.COLOR_WHITE, -1),    # L
+        1: (_color.get(pal.get("I", "CYAN"), curses.COLOR_CYAN), -1),
+        2: (_color.get(pal.get("O", "YELLOW"), curses.COLOR_YELLOW), -1),
+        3: (_color.get(pal.get("T", "MAGENTA"), curses.COLOR_MAGENTA), -1),
+        4: (_color.get(pal.get("S", "GREEN"), curses.COLOR_GREEN), -1),
+        5: (_color.get(pal.get("Z", "RED"), curses.COLOR_RED), -1),
+        6: (_color.get(pal.get("J", "BLUE"), curses.COLOR_BLUE), -1),
+        7: (_color.get(pal.get("L", "WHITE"), curses.COLOR_WHITE), -1),
     }
     pairs: dict[str, int] = {}
     for pid, (fg, bg) in defs.items():
@@ -506,6 +555,8 @@ def _init_colors() -> dict[str, int]:
 
 # Set by CursesApp when mono mode is on/off (draw_block can't see the app).
 _MONO = False
+# Active piece skin (Solid/Outline/Letters/Dots), synced from settings.
+_SKIN = "Solid"
 
 
 def draw_block(win, y: int, x: int, color_pair: int, ghost: bool = False,
@@ -522,9 +573,15 @@ def draw_block(win, y: int, x: int, color_pair: int, ghost: bool = False,
             else:
                 win.addstr(y, x, "  ", curses.color_pair(35) | curses.A_BOLD)
         elif ghost:
-            # hollow ghost: dim outline using brackets
             win.addstr(y, x, "░░", curses.color_pair(color_pair) | curses.A_DIM)
-        else:
+        elif _SKIN == "Outline":
+            win.addstr(y, x, "[]", curses.color_pair(color_pair) | curses.A_BOLD)
+        elif _SKIN == "Letters":
+            ch = ID_TO_PIECE.get(color_pair, "?")[:1]
+            win.addstr(y, x, ch * 2, curses.color_pair(color_pair) | curses.A_BOLD)
+        elif _SKIN == "Dots":
+            win.addstr(y, x, "::", curses.color_pair(color_pair) | curses.A_BOLD)
+        else:  # Solid
             win.addstr(y, x, "  ", curses.color_pair(color_pair + 10) | curses.A_BOLD)
     except Exception:
         pass
@@ -553,8 +610,11 @@ class CursesApp:
         self.engine = TetrisEngine(seed=args.seed)
         self.pairs: dict[str, int] = {}
         self.paused = False
-        self.show_ghost = not args.no_ghost
-        self.mono = args.mono
+        cfg = load_settings()
+        self.show_ghost = cfg["ghost"] if not args.no_ghost else False
+        self.mono = cfg["mono"] or args.mono
+        self.piece_skin = cfg["skin"]
+        self.theme = cfg["theme"]
         self.highscore = load_highscore()
         self.new_high = False
         self.start_time = time.monotonic()
@@ -574,11 +634,14 @@ class CursesApp:
         self.in_settings = False
         self.settings_index = 0
         # user settings (preserved across restarts)
-        self.visible_next = VISIBLE_NEXT
+        self.visible_next = cfg["next"]
         self._menu_buttons: list[tuple[str, int, int, int]] = []  # (id, y, x, w)
         self.over_index = 0  # game-over menu selection
         self.flash_rows: list[int] = []
         self.flash_until = 0.0
+        global _MONO, _SKIN  # sync early so first render is correct
+        _MONO = bool(self.mono)
+        _SKIN = self.piece_skin
 
     # -- input ------------------------------------------------------------
     def open_menu(self, now: float) -> None:
@@ -601,29 +664,38 @@ class CursesApp:
         """Restart the run but keep user settings + high score state."""
         args = self.args
         stdscr = self.stdscr
-        show_ghost, mono, visible_next = self.show_ghost, self.mono, self.visible_next
+        saved = (self.show_ghost, self.mono, self.visible_next,
+                 self.piece_skin, self.theme)
         highscore, new_high = self.highscore, self.new_high
         self.__init__(stdscr, args)
-        self.show_ghost, self.mono, self.visible_next = show_ghost, mono, visible_next
+        (self.show_ghost, self.mono, self.visible_next,
+         self.piece_skin, self.theme) = saved
         self.highscore = highscore
         self.new_high = new_high
         self.apply_color_mode()
 
     def apply_color_mode(self) -> None:
-        global _MONO
+        global _MONO, _SKIN
         _MONO = bool(self.mono)
+        _SKIN = self.piece_skin
         if self.mono:
             self.pairs = {k: 20 for k in self.pairs}
         else:
             try:
-                self.pairs = _init_colors()
+                self.pairs = _init_colors(self.theme)
             except Exception:
                 pass
+
+    def persist_settings(self) -> None:
+        save_settings(self.show_ghost, self.mono, self.visible_next,
+                      self.piece_skin, self.theme)
 
     def settings_rows(self) -> list[tuple[str, str]]:
         return [
             ("Ghost piece", "ON" if self.show_ghost else "OFF"),
             ("Colors", "OFF (mono)" if self.mono else "ON"),
+            ("Piece skin", self.piece_skin),
+            ("Theme", self.theme),
             ("Next preview", str(self.visible_next)),
             ("Reset best score", "press →"),
         ]
@@ -631,14 +703,25 @@ class CursesApp:
     def adjust_setting(self, direction: int) -> None:
         i = self.settings_index
         if i == 0:
-            self.show_ghost = not self.show_ghost if direction != 0 else self.show_ghost
+            if direction != 0:
+                self.show_ghost = not self.show_ghost
         elif i == 1:
             if direction != 0:
                 self.mono = not self.mono
                 self.apply_color_mode()
         elif i == 2:
-            self.visible_next = min(5, max(1, self.visible_next + direction))
+            if direction != 0:
+                cur = TETRIS_SKINS.index(self.piece_skin)
+                self.piece_skin = TETRIS_SKINS[(cur + direction) % len(TETRIS_SKINS)]
+                self.apply_color_mode()
         elif i == 3:
+            if direction != 0:
+                cur = TETRIS_THEMES.index(self.theme)
+                self.theme = TETRIS_THEMES[(cur + direction) % len(TETRIS_THEMES)]
+                self.apply_color_mode()
+        elif i == 4:
+            self.visible_next = min(5, max(1, self.visible_next + direction))
+        elif i == 5:
             if direction != 0:
                 self.highscore = 0
                 try:
@@ -646,6 +729,7 @@ class CursesApp:
                         os.remove(HIGHSCORE_PATH)
                 except Exception:
                     pass
+        self.persist_settings()
 
     def activate_menu_item(self, now: float) -> str | None:
         item = self.menu_items[self.menu_index]
@@ -760,6 +844,7 @@ class CursesApp:
             return None
         if key in (ord("m"), ord("M")):
             self.show_ghost = not self.show_ghost
+            self.persist_settings()
             return None
         if key in (ord("r"), ord("R")):
             return "restart"

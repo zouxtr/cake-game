@@ -1,104 +1,106 @@
-# 🍰 Caketris
+# 🍰 Cake Arcade
 
-A polished Tetris for the Linux terminal. Single file, zero dependencies —
+Two polished games for the Linux terminal. Single files, zero dependencies —
 just Python 3 + `curses` (preinstalled on virtually every Linux distro).
+
+- **🍰 Caketris** — polished Tetris: 7-bag, ghost, hold, levels, combo scoring
+- **👻 Cakeman** — Pac-Man-style maze chase with 4 ghost personalities
 
 ![requires a terminal ≥ 72×26 with color support]
 
 ## Download & install
 
-**Option 1 — one-line install with curl** (recommended):
+**One-line install with curl** (recommended — installs all three commands):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zouxtr/cake-game/main/install.sh | bash
 ```
 
-This downloads the game to `~/.local/bin/caketris` and makes it executable.
-Then just run:
+Then run the picker:
 
 ```bash
-caketris
+cake-game
 ```
 
-> If your shell says `caketris: command not found`, `~/.local/bin` is not on
-> your PATH. Add this to `~/.bashrc` and restart your terminal:
+or launch a game directly:
+
+```bash
+caketris    # tetris
+cakeman     # pacman clone
+```
+
+> If your shell says `command not found`, `~/.local/bin` is not on your
+> PATH. Add this to `~/.bashrc` and restart your terminal:
 >
 > ```bash
 > export PATH="$HOME/.local/bin:$PATH"
 > ```
 
-**Option 2 — manual download:**
+**Manual download:**
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/zouxtr/cake-game/main/caketris \
-  -o ~/.local/bin/caketris
-chmod +x ~/.local/bin/caketris
-caketris
+for g in caketris cakeman cake-game; do
+  curl -fsSL "https://raw.githubusercontent.com/zouxtr/cake-game/main/$g" \
+    -o ~/.local/bin/$g
+  chmod +x ~/.local/bin/$g
+done
 ```
 
-**Option 3 — clone the repo:**
+**Clone the repo:**
 
 ```bash
 git clone https://github.com/zouxtr/cake-game.git
 cd cake-game
-./caketris
+./cake-game    # or ./caketris / ./cakeman
 ```
 
-Extra flags: `caketris --help`, `caketris --seed 42` (reproducible pieces),
-`caketris --no-ghost`, `caketris --mono`, `caketris --test` (self-test).
-
-## Remove the game
-
-Delete the installed binary:
+## Remove the games
 
 ```bash
-rm ~/.local/bin/caketris
+rm ~/.local/bin/caketris ~/.local/bin/cakeman ~/.local/bin/cake-game
 ```
 
-Optionally also delete your saved best score:
+Optionally delete saved best scores and settings:
 
 ```bash
-rm ~/.caketris_highscore.json
+rm -f ~/.caketris_highscore.json ~/.caketris_settings.json \
+      ~/.cakeman_highscore.json ~/.cakeman_settings.json
 ```
 
-That's everything — caketris keeps no other files on your system.
+That's everything — the games keep no other files on your system.
 
-## Controls
+## Caketris controls
 
 | Key | Action |
 |-----|--------|
 | `←` `→` / `H` `L` | move (exactly one cell per press) |
 | `↓` / `S` / `J` | HOLD for fast fall (+1/cell, never teleports) |
 | `↑` / `X` / `W` | rotate clockwise |
-| `Z` | rotate counter-clockwise |
-| `A` | rotate 180° |
+| `Z` / `A` | counter-clockwise / 180° |
 | `SPACE` | hard drop (+2/cell) |
 | `C` | hold |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
-| `R` | quick restart (keeps your settings) |
-| `Q` | quit |
-| `M` | toggle ghost piece |
+| `R` / `Q` | quick restart / quit |
 
-Holding `←`/`→` repeats via your terminal's own key-repeat, so a single
-tap always moves exactly one cell.
+Settings: ghost piece, colors, **piece skin** (Solid/Outline/Letters/Dots),
+**theme** (Classic/Candy/Ocean/Sunset), next-preview count, reset best.
 
-### Pause menu & settings
+## Cakeman controls
 
-Press `ESC` (or `P`) mid-game to pause and open the menu. Navigate with
-`↑↓` + `Enter` (or `1`–`4`); where the terminal supports mouse, buttons
-are clickable. Settings lets you toggle the ghost piece and colors,
-change the next-preview count (1–5), and reset the best score.
+| Key | Action |
+|-----|--------|
+| Arrows / WASD / HJKL | steer (turns are buffered — steer early) |
+| `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
+| `R` / `Q` | quick restart / quit |
+| `M` | toggle colors |
 
-## Features
+Eat every crumb to clear the maze. Power treats send the ghosts running —
+hunt them for 200 → 400 → 800 → 1600. Three lives per run, endless levels.
 
-- Regulation 10×20 board, 7-bag randomizer, SRS-style wall kicks
-- Ghost piece, hold queue, next-piece preview
-- Guideline scoring: 100/300/500/800 × level, 1.5× back-to-back Tetris
-  bonus, combo bonus, soft/hard-drop points
-- Level every 10 lines with real gravity curve + progress bar
-- Lock delay, line-clear flash, clean pause/settings/game-over menus
-- Live stats and persistent best score in `~/.caketris_highscore.json`
+Settings: **character skin** (Cake/Arcade/Retro/Letters — changes you, the
+four ghosts, crumbs and walls), **theme** (Classic/Candy/Midnight/Forest),
+speed (Chill/Normal/Turbo), reset best.
 
 ## Requirements
 

@@ -1,0 +1,1236 @@
+#!/usr/bin/env python3
+"""
+Cakeman — a Pac-Man-style maze chase for the Linux terminal.
+
+  cakeman            # play
+  cakeman --help     # options
+
+Controls:
+  ←→↑↓ / WASD / HJKL   steer (buffered — turn early, it remembers)
+  ESC / P              pause menu (Continue · Restart · Settings · Quit)
+  R                    quick restart
+  Q                    quit
+  M                    toggle color (mono)
+
+Eat every crumb to clear the maze. Power treats send the ghosts running —
+chase them down for 200 → 400 → 800 → 1600. Three lives per run.
+
+Skins change every character on screen (you, the four ghosts, crumbs,
+walls); themes recolor the maze. Both live in the Settings menu and are
+remembered between runs. Requires only the Python standard library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+MAZE = [
+    "###################",
+    "#........#........#",
+    "#.##.###.#.###.##.#",
+    "#o##.###.#.###.##o#",
+    "#.##.###.#.###.##.#",
+    "#.................#",
+    "#.##.#.#####.#.##.#",
+    "#.##.#.#####.#.##.#",
+    "#....#...#...#....#",
+    "#####.##---##.#####",
+    "       #GGG#       ",
+    "#####.##---##.#####",
+    "#....#...#...#....#",
+    "#.##.#.#####.#.##.#",
+    "#.##.#.#####.#.##.#",
+    "#.................#",
+    "#.##.###.#.###.##.#",
+    "#o##.###.#.###.##o#",
+    "#.##.###.#.###.##.#",
+    "#........#........#",
+    "###################",
+]
+MW, MH = 19, 21
+DOOR = [(8, 9), (9, 9), (10, 9)]   # ghost-house door (ghosts only)
+HOUSE = [(8, 10), (9, 10), (10, 10)]
+EYE_REVIVE = (8, 8)                # eyes target: tile above the door
+PLAYER_START = (9, 15)
+SCATTER_CORNERS = [(17, 1), (1, 1), (17, 19), (1, 19)]
+GHOST_NAMES = ["Blinky", "Pinky", "Inky", "Clyde"]
+
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".cakeman_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".cakeman_settings.json")
+
+# Skins: every on-screen character is skinnable. Ghosts always differ from
+# the player and (except Retro) from each other.
+SKINS: dict[str, dict] = {
+    "Cake": {"player": ("C", "c"), "ghosts": ["G", "H", "O", "S"],
+             "fright": "?", "eyes": ":", "pellet": ".", "power": "o",
+             "wall": "#"},
+    "Arcade": {"player": ("@", "a"), "ghosts": ["R", "P", "C", "O"],
+               "fright": "F", "eyes": "e", "pellet": ".", "power": "*",
+               "wall": "#"},
+    "Retro": {"player": ("O", "o"), "ghosts": ["X", "Y", "Z", "W"],
+              "fright": "F", "eyes": ".", "pellet": ".", "power": "O",
+              "wall": "+"},
+    "Letters": {"player": ("P", "p"), "ghosts": ["B", "N", "I", "C"],
+                "fright": "!", "eyes": ";", "pellet": "'", "power": '"',
+                "wall": "#"},
+}
+SKIN_NAMES = list(SKINS.keys())
+
+THEMES: dict[str, dict] = {
+    "Classic": {"maze": "BLUE", "player": "YELLOW",
+                "ghosts": ["RED", "MAGENTA", "CYAN", "WHITE"],
+                "pellet": "WHITE"},
+    "Candy": {"maze": "MAGENTA", "player": "YELLOW",
+              "ghosts": ["RED", "CYAN", "GREEN", "WHITE"],
+              "pellet": "WHITE"},
+    "Midnight": {"maze": "BLUE", "player": "WHITE",
+                 "ghosts": ["CYAN", "MAGENTA", "RED", "YELLOW"],
+                 "pellet": "CYAN"},
+    "Forest": {"maze": "GREEN", "player": "YELLOW",
+               "ghosts": ["RED", "WHITE", "CYAN", "MAGENTA"],
+               "pellet": "WHITE"},
+}
+THEME_NAMES = list(THEMES.keys())
+
+SPEEDS = {"Chill": 1.35, "Normal": 1.0, "Turbo": 0.72}
+SPEED_NAMES = list(SPEEDS.keys())
+
+BASE_PLAYER = 0.105
+BASE_GHOST = 0.128
+BASE_FRIGHT = 0.175
+BASE_EYES = 0.060
+
+
+def fright_time(level: int) -> float:
+    return max(6.0 - 0.7 * (level - 1), 1.5)
+
+
+def load_highscore() -> int:
+    try:
+        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
+            return int(json.load(f).get("highscore", 0))
+    except Exception:
+        return 0
+
+
+def save_highscore(score: int) -> None:
+    try:
+        if score <= load_highscore():
+            return
+        with open(HIGHSCORE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"highscore": int(score)}, f)
+    except Exception:
+        pass
+
+
+def load_settings() -> dict:
+    defaults = {"skin": "Cake", "theme": "Classic", "speed": "Normal",
+                "mono": False}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+        if defaults["skin"] not in SKINS:
+            defaults["skin"] = "Cake"
+        if defaults["theme"] not in THEMES:
+            defaults["theme"] = "Classic"
+        if defaults["speed"] not in SPEEDS:
+            defaults["speed"] = "Normal"
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(skin: str, theme: str, speed: str, mono: bool) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"skin": skin, "theme": theme, "speed": speed,
+                       "mono": mono}, f)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Engine (no curses — fully testable headless)
+# --------------------------------------------------------------------------
+
+DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+OPPOSITE = {"up": "down", "down": "up", "left": "right", "right": "left"}
+
+
+def _manhattan(a, b) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+class PacEngine:
+    def __init__(self, seed: int | None = None, speed: str = "Normal"):
+        self.rng = random.Random(seed)
+        self.speed_mult = SPEEDS.get(speed, 1.0)
+        self.score = 0
+        self.lives = 3
+        self.level = 1
+        self.game_over = False
+        self.ready_timer = 1.6  # "READY!" freeze at run/level start
+        self._build_level()
+        self.reset_positions()
+        self.release_timers = [0.0, 1.5, 4.0, 7.0]
+
+    # -- maze -------------------------------------------------------------
+    def _build_level(self) -> None:
+        self.pellets: set[tuple[int, int]] = set()
+        self.powers: set[tuple[int, int]] = set()
+        for y, row in enumerate(MAZE):
+            for x, ch in enumerate(row):
+                if ch == ".":
+                    self.pellets.add((x, y))
+                elif ch == "o":
+                    self.powers.add((x, y))
+        self.total_crumbs = len(self.pellets) + len(self.powers)
+
+    def cell(self, x: int, y: int) -> str:
+        if 0 <= y < MH and 0 <= x < MW:
+            return MAZE[y][x]
+        return " "
+
+    def walkable(self, x: int, y: int, ghost: bool = False,
+                 can_door: bool = False) -> bool:
+        if y == 10 and (x < 0 or x >= MW):
+            return True  # tunnel row wraps sideways
+        if not (0 <= x < MW and 0 <= y < MH):
+            return False
+        ch = MAZE[y][x]
+        if ch == "#":
+            return False
+        if (x, y) in DOOR or ch == "-":
+            return ghost and can_door
+        if ch == "G":
+            return ghost and can_door
+        return True
+
+    # -- actors -------------------------------------------------------------
+    def reset_positions(self) -> None:
+        self.player = {"pos": PLAYER_START, "dir": "left", "buf": "left"}
+        self.ghosts = []
+        for i in range(4):
+            self.ghosts.append({
+                "name": GHOST_NAMES[i], "pos": HOUSE[i % len(HOUSE)],
+                "dir": "up" if i < 2 else "down",
+                "state": "house",  # house | leaving | active | fright | eyes
+                "corner": SCATTER_CORNERS[i],
+                "acc": 0.0,
+            })
+        self.player_acc = 0.0
+        self.fright_timer = 0.0
+        self.ghost_chain = 0
+        self.mode = "scatter"
+        self.mode_timer = 0.0
+        self.mode_stage = 0
+        self.release_timers = [0.0, 1.5, 4.0, 7.0]
+        self.ready_timer = max(self.ready_timer, 0.0)
+
+    def player_interval(self) -> float:
+        return max(BASE_PLAYER * self.speed_mult - 0.004 * (self.level - 1), 0.055)
+
+    def ghost_interval(self, state: str) -> float:
+        if state == "eyes":
+            return BASE_EYES
+        if state == "fright":
+            return BASE_FRIGHT * self.speed_mult
+        return max((BASE_GHOST - 0.005 * (self.level - 1)) * self.speed_mult, 0.07)
+
+    # -- per-frame update -----------------------------------------------------
+    def update(self, dt: float) -> None:
+        if self.game_over:
+            return
+        if self.ready_timer > 0:
+            self.ready_timer -= dt
+            return
+        # release timers for house ghosts
+        for i, g in enumerate(self.ghosts):
+            if g["state"] == "house":
+                self.release_timers[i] -= dt
+                if self.release_timers[i] <= 0:
+                    g["state"] = "leaving"
+        # scatter/chase waves
+        self.mode_timer += dt
+        schedule = [("scatter", 4.0), ("chase", 12.0), ("scatter", 4.0),
+                    ("chase", 14.0), ("scatter", 3.0), ("chase", 1e9)]
+        want, dur = schedule[min(self.mode_stage, len(schedule) - 1)]
+        if self.mode != want:
+            self.mode = want
+            for g in self.ghosts:
+                if g["state"] in ("active", "fright"):
+                    g["dir"] = OPPOSITE[g["dir"]]  # classic turnaround
+        if self.mode_timer >= dur and self.mode_stage < len(schedule) - 1:
+            self.mode_timer = 0.0
+            self.mode_stage += 1
+        # fright countdown
+        if self.fright_timer > 0:
+            self.fright_timer -= dt
+            if self.fright_timer <= 0:
+                self.fright_timer = 0
+                self.ghost_chain = 0
+                for g in self.ghosts:
+                    if g["state"] == "fright":
+                        g["state"] = "active"
+        # move player + ghosts
+        self.player_acc += dt
+        while self.player_acc >= self.player_interval():
+            self.player_acc -= self.player_interval()
+            self._step_player()
+            if self.game_over:
+                return
+        for g in self.ghosts:
+            g["acc"] += dt
+            iv = self.ghost_interval(g["state"] if g["state"] != "leaving" else "active")
+            steps = 0
+            while g["acc"] >= iv and steps < 4:
+                g["acc"] -= iv
+                steps += 1
+                self._step_ghost(g)
+                if self.game_over:
+                    return
+        self._collisions()
+
+    # -- player ---------------------------------------------------------------
+    def steer(self, d: str) -> None:
+        if d in DIRS:
+            self.player["buf"] = d
+
+    def _step_player(self) -> None:
+        p = self.player
+        # try buffered turn first
+        bx, by = DIRS[p["buf"]]
+        nx, ny = (p["pos"][0] + bx) % MW, p["pos"][1] + by
+        if self.walkable(nx, ny):
+            p["dir"] = p["buf"]
+        dx, dy = DIRS[p["dir"]]
+        nx, ny = (p["pos"][0] + dx) % MW, p["pos"][1] + dy
+        if not self.walkable(nx, ny):
+            return  # wall: wait
+        p["pos"] = (nx, ny)
+        if (nx, ny) in self.pellets:
+            self.pellets.discard((nx, ny))
+            self.score += 10
+        elif (nx, ny) in self.powers:
+            self.powers.discard((nx, ny))
+            self.score += 50
+            self.start_fright()
+        if not self.pellets and not self.powers:
+            self._level_clear()
+
+    def start_fright(self) -> None:
+        self.fright_timer = fright_time(self.level)
+        self.ghost_chain = 0
+        for g in self.ghosts:
+            if g["state"] == "active":
+                g["state"] = "fright"
+                g["dir"] = OPPOSITE[g["dir"]]
+
+    def _level_clear(self) -> None:
+        self.level += 1
+        self.score += 500
+        self._build_level()
+        self.reset_positions()
+        self.ready_timer = 1.6
+
+    # -- ghosts -----------------------------------------------------------------
+    def _ghost_target(self, g) -> tuple[int, int]:
+        px, py = self.player["pos"]
+        dx, dy = DIRS[self.player["dir"]]
+        if g["state"] == "eyes":
+            return EYE_REVIVE
+        if self.mode == "scatter" or g["state"] == "house":
+            return g["corner"]
+        i = GHOST_NAMES.index(g["name"])
+        if i == 0:
+            return (px, py)
+        if i == 1:
+            return (px + 4 * dx, py + 4 * dy)
+        if i == 2:
+            b = self.ghosts[0]["pos"]
+            return (px + (px - b[0]), py + (py - b[1]))
+        # Clyde: shy — backs off when close
+        if _manhattan(g["pos"], (px, py)) > 6:
+            return (px, py)
+        return g["corner"]
+
+    def _step_ghost(self, g) -> None:
+        x, y = g["pos"]
+        if g["state"] == "house":
+            return
+        if g["state"] == "leaving":
+            self._step_leaving(g)
+            return
+        can_door = g["state"] == "eyes"
+        if g["state"] == "fright":
+            # random turn, no reversing unless dead end
+            opts = self._exits(x, y, g["dir"], ghost=True, can_door=False)
+            if opts:
+                g["dir"] = self.rng.choice(opts)
+            g["pos"] = self._advance(g["pos"], g["dir"])
+            return
+        target = self._ghost_target(g)
+        opts = self._exits(x, y, g["dir"], ghost=True, can_door=can_door)
+        if not opts:
+            g["dir"] = OPPOSITE[g["dir"]]
+            g["pos"] = self._advance(g["pos"], g["dir"])
+            return
+        best = min(opts, key=lambda d: _manhattan(self._advance((x, y), d), target))
+        g["dir"] = best
+        g["pos"] = self._advance((x, y), best)
+        if g["state"] == "eyes" and g["pos"] == EYE_REVIVE:
+            g["state"] = "leaving"  # dive back in, then out again
+
+    def _step_leaving(self, g) -> None:
+        # path: shuffle to x=8 inside house, up through the door, out
+        x, y = g["pos"]
+        if (x, y) == (8, 10) or (x, y) in DOOR:
+            pass
+        if y == 10 and x != 8:
+            g["pos"] = (x - 1 if x > 8 else x + 1, 10)
+        elif y == 10:
+            g["pos"] = (8, 9)
+        elif (x, y) in DOOR:
+            g["pos"] = (8, 8)
+        elif (x, y) == (8, 8):
+            g["state"] = "active"
+            g["dir"] = "left"
+        else:  # eyes arriving from outside funnel to the door
+            g["pos"] = (8, 9) if x == 8 else (x, y)
+
+    def _exits(self, x: int, y: int, cur: str, ghost: bool,
+               can_door: bool) -> list[str]:
+        out = []
+        for d, (dx, dy) in DIRS.items():
+            if d == OPPOSITE[cur]:
+                continue
+            nx = (x + dx) % MW if y == 10 else x + dx
+            ny = y + dy
+            if self.walkable(nx, ny, ghost=ghost, can_door=can_door):
+                # ghosts avoid climbing back into the house while active
+                if ghost and not can_door and (nx, ny) in DOOR:
+                    continue
+                out.append(d)
+        return out
+
+    def _advance(self, pos, d: str) -> tuple[int, int]:
+        dx, dy = DIRS[d]
+        x = (pos[0] + dx) % MW if pos[1] == 10 else pos[0] + dx
+        return (x, pos[1] + dy)
+
+    # -- collisions ---------------------------------------------------------------
+    def _collisions(self) -> None:
+        p = self.player["pos"]
+        for g in self.ghosts:
+            if g["pos"] != p or g["state"] in ("house", "leaving", "eyes"):
+                continue
+            if g["state"] == "fright":
+                self.ghost_chain += 1
+                self.score += 200 * (2 ** (self.ghost_chain - 1))
+                g["state"] = "eyes"
+                g["acc"] = 0.0
+            else:
+                self._death()
+                return
+
+    def _death(self) -> None:
+        self.lives -= 1
+        if self.lives <= 0:
+            self.game_over = True
+            return
+        self.reset_positions()
+        self.ready_timer = 1.4
+
+
+# --------------------------------------------------------------------------
+# High score / colors
+# --------------------------------------------------------------------------
+
+def _init_colors(theme: str = "Classic") -> None:
+    import curses
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except Exception:
+        pass
+    _color = {"BLACK": curses.COLOR_BLACK, "RED": curses.COLOR_RED,
+              "GREEN": curses.COLOR_GREEN, "YELLOW": curses.COLOR_YELLOW,
+              "BLUE": curses.COLOR_BLUE, "MAGENTA": curses.COLOR_MAGENTA,
+              "CYAN": curses.COLOR_CYAN, "WHITE": curses.COLOR_WHITE}
+    pal = THEMES.get(theme, THEMES["Classic"])
+    pairs = {
+        1: (_color.get(pal["maze"], curses.COLOR_BLUE), -1),
+        2: (_color.get(pal["player"], curses.COLOR_YELLOW), -1),
+        7: (_color.get(pal["pellet"], curses.COLOR_WHITE), -1),
+        8: (curses.COLOR_WHITE, curses.COLOR_BLUE),
+        9: (curses.COLOR_BLACK, curses.COLOR_WHITE),
+        20: (curses.COLOR_WHITE, -1),
+    }
+    for i, gname in enumerate(pal["ghosts"]):
+        pairs[3 + i] = (_color.get(gname, curses.COLOR_RED), -1)
+    for pid, (fg, bg) in pairs.items():
+        try:
+            curses.init_pair(pid, fg, bg)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Curses UI
+# --------------------------------------------------------------------------
+
+class CursesApp:
+    def __init__(self, stdscr, args):
+        self.stdscr = stdscr
+        self.args = args
+        cfg = load_settings()
+        self.skin_name = cfg["skin"]
+        self.theme_name = cfg["theme"]
+        self.speed_name = cfg["speed"] if not args.speed else args.speed
+        if self.speed_name not in SPEEDS:
+            self.speed_name = "Normal"
+        self.mono = cfg["mono"] or args.mono
+        self.engine = PacEngine(seed=args.seed, speed=self.speed_name)
+        self.highscore = load_highscore()
+        self.new_high = False
+        self.paused = False
+        self.menu_open = False
+        self.menu_index = 0
+        self.menu_items = ["Continue", "Restart", "Settings", "Quit"]
+        self.in_settings = False
+        self.settings_index = 0
+        self.over_index = 0
+        self._menu_buttons: list[tuple[str, int, int, int]] = []
+        self.elapsed = 0.0
+        self._pause_started = 0.0
+        self.elapsed_pause = 0.0
+        self.mouth = 0.0
+
+    # -- settings -----------------------------------------------------------
+    def skin(self) -> dict:
+        return SKINS[self.skin_name]
+
+    def settings_rows(self):
+        return [
+            ("Character skin", self.skin_name),
+            ("Theme", self.theme_name),
+            ("Speed", self.speed_name),
+            ("Colors", "OFF (mono)" if self.mono else "ON"),
+            ("Reset best score", "press →"),
+        ]
+
+    def adjust_setting(self, direction: int) -> None:
+        i = self.settings_index
+        if i == 0 and direction != 0:
+            cur = SKIN_NAMES.index(self.skin_name)
+            self.skin_name = SKIN_NAMES[(cur + direction) % len(SKIN_NAMES)]
+        elif i == 1 and direction != 0:
+            cur = THEME_NAMES.index(self.theme_name)
+            self.theme_name = THEME_NAMES[(cur + direction) % len(THEME_NAMES)]
+            try:
+                _init_colors(self.theme_name)
+            except Exception:
+                pass
+        elif i == 2 and direction != 0:
+            cur = SPEED_NAMES.index(self.speed_name)
+            self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
+            self.engine.speed_mult = SPEEDS[self.speed_name]
+        elif i == 3 and direction != 0:
+            self.mono = not self.mono
+        elif i == 4 and direction != 0:
+            self.highscore = 0
+            try:
+                if os.path.exists(HIGHSCORE_PATH):
+                    os.remove(HIGHSCORE_PATH)
+            except Exception:
+                pass
+        self.persist_settings()
+
+    def persist_settings(self) -> None:
+        save_settings(self.skin_name, self.theme_name, self.speed_name,
+                      self.mono)
+
+    # -- menu state -----------------------------------------------------------
+    def open_menu(self, now: float) -> None:
+        if self.engine.game_over:
+            return
+        if not self.menu_open:
+            self.menu_open = True
+            self.in_settings = False
+            self.menu_index = 0
+            if not self.paused:
+                self.toggle_pause(now)
+
+    def close_menu(self, now: float) -> None:
+        self.menu_open = False
+        self.in_settings = False
+        if self.paused:
+            self.toggle_pause(now)
+
+    def toggle_pause(self, now: float) -> None:
+        if self.paused:
+            self.elapsed_pause += now - self._pause_started
+            self.paused = False
+        else:
+            self._pause_started = now
+            self.paused = True
+
+    def restart(self) -> None:
+        args, stdscr = self.args, self.stdscr
+        skin, theme, speed, mono = (self.skin_name, self.theme_name,
+                                    self.speed_name, self.mono)
+        highscore = self.highscore
+        self.__init__(stdscr, args)
+        (self.skin_name, self.theme_name, self.speed_name,
+         self.mono) = (skin, theme, speed, mono)
+        self.engine.speed_mult = SPEEDS[speed]
+        self.highscore = highscore
+        _init_colors(theme)
+
+    def on_game_over(self) -> None:
+        if self.engine.score > self.highscore:
+            self.highscore = self.engine.score
+            self.new_high = True
+            save_highscore(self.engine.score)
+
+    # -- input ------------------------------------------------------------------
+    KEYMAP = {
+        "up": ["up", "w", "k"], "down": ["down", "s", "j"],
+        "left": ["left", "a", "h"], "right": ["right", "d", "l"],
+    }
+
+    def key_to_dir(self, key: int) -> str | None:
+        import curses
+        if key in (curses.KEY_UP, ord("w"), ord("W"), ord("k"), ord("K")):
+            return "up"
+        if key in (curses.KEY_DOWN, ord("s"), ord("S"), ord("j"), ord("J")):
+            return "down"
+        if key in (curses.KEY_LEFT, ord("a"), ord("A"), ord("h"), ord("H")):
+            return "left"
+        if key in (curses.KEY_RIGHT, ord("d"), ord("D"), ord("l"), ord("L")):
+            return "right"
+        return None
+
+    def handle_key(self, key: int, now: float) -> str | None:
+        import curses
+        e = self.engine
+        KEY_MOUSE = getattr(curses, "KEY_MOUSE", -9999)
+        if key == KEY_MOUSE:
+            return self.handle_mouse()
+
+        if self.menu_open and self.in_settings:
+            if key in (27, ord("b"), ord("B")):
+                self.in_settings = False
+                return None
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.settings_index = (self.settings_index - 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.settings_index = (self.settings_index + 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
+                self.adjust_setting(-1)
+                return None
+            if key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
+                self.adjust_setting(+1)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                self.adjust_setting(+1)
+                return None
+            if key in (ord("q"), ord("Q")):
+                self.in_settings = False
+                return None
+            return None
+
+        if self.menu_open:
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.menu_index = (self.menu_index - 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.menu_index = (self.menu_index + 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return self.activate_menu_item(now)
+            if key == 27:
+                self.close_menu(now)
+                return None
+            if key in (ord("p"), ord("P"), ord("c"), ord("C")):
+                self.close_menu(now)
+                return None
+            if key in (ord("r"), ord("R")):
+                self.restart()
+                return None
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            for i in range(len(self.menu_items)):
+                if key == ord(str(i + 1)):
+                    self.menu_index = i
+                    return self.activate_menu_item(now)
+            return None
+
+        if e.game_over:
+            if key in (curses.KEY_LEFT, curses.KEY_RIGHT, 9):
+                self.over_index = 1 - self.over_index
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return "restart" if self.over_index == 0 else "quit"
+            if key in (ord("r"), ord("R")):
+                return "restart"
+            if key in (ord("q"), ord("Q"), 27):
+                return "quit"
+            return None
+
+        if key == 27:
+            self.open_menu(now)
+            return None
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (ord("p"), ord("P")):
+            self.open_menu(now)
+            return None
+        if key in (ord("r"), ord("R")):
+            return "restart"
+        if key in (ord("m"), ord("M")):
+            self.mono = not self.mono
+            self.persist_settings()
+            return None
+        if self.paused:
+            return None
+        d = self.key_to_dir(key)
+        if d:
+            e.steer(d)
+        return None
+
+    def activate_menu_item(self, now: float) -> str | None:
+        item = self.menu_items[self.menu_index]
+        if item == "Continue":
+            self.close_menu(now)
+        elif item == "Restart":
+            self.restart()
+        elif item == "Settings":
+            self.in_settings = True
+            self.settings_index = 0
+        elif item == "Quit":
+            return "quit"
+        return None
+
+    def handle_mouse(self) -> str | None:
+        import curses
+        now = time.monotonic()
+        try:
+            _id, mx, my, _z, _b = curses.getmouse()
+        except Exception:
+            return None
+        for (bid, by, bx, bw) in self._menu_buttons:
+            if by == my and bx <= mx < bx + bw:
+                if self.engine.game_over and not self.menu_open:
+                    return "restart" if bid == "over_restart" else "quit"
+                if self.menu_open and not self.in_settings:
+                    for i in range(len(self.menu_items)):
+                        if bid == f"menu_{i}":
+                            self.menu_index = i
+                            return self.activate_menu_item(now)
+                elif self.menu_open and self.in_settings:
+                    if bid == "set_back":
+                        self.in_settings = False
+        return None
+
+    # -- main loop ------------------------------------------------------------
+    def run(self) -> None:
+        import curses
+        stdscr = self.stdscr
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(8)
+        stdscr.keypad(True)
+        try:
+            curses.set_escdelay(25)
+        except Exception:
+            pass
+        try:
+            _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
+                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+            curses.mousemask(_mm)
+        except Exception:
+            pass
+        _init_colors(self.theme_name)
+
+        prev = time.monotonic()
+        while True:
+            now = time.monotonic()
+            dt = min(0.1, now - prev)
+            prev = now
+            while True:
+                try:
+                    key = stdscr.getch()
+                except Exception:
+                    key = -1
+                if key == -1:
+                    break
+                sig = self.handle_key(key, now)
+                if sig == "quit":
+                    self.on_game_over()
+                    return
+                if sig == "restart":
+                    self.restart()
+                    prev = time.monotonic()
+                    break
+            if not self.paused and not self.engine.game_over:
+                self.engine.update(dt)
+                if self.engine.game_over:
+                    self.on_game_over()
+            self.mouth += dt
+            self.render(now)
+            elapsed = time.monotonic() - now
+            if elapsed < 0.005:
+                time.sleep(0.005 - elapsed)
+
+    # -- rendering --------------------------------------------------------------
+    def pair(self, name: str) -> int:
+        import curses
+        table = {"maze": 1, "player": 2, "pellet": 7, "fright": 8,
+                 "g0": 3, "g1": 4, "g2": 5, "g3": 6}
+        try:
+            if self.mono:
+                return curses.color_pair(20)
+            return curses.color_pair(table.get(name, 20))
+        except Exception:
+            return curses.A_NORMAL
+
+    def put(self, x: int, y: int, text: str, attr: int = 0) -> None:
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except Exception:
+            pass
+
+    def text_box(self, x: int, y: int, w: int, h: int, title: str = "") -> None:
+        import curses
+        if h <= 0:
+            return
+        try:
+            self.stdscr.addstr(y, x, "┌" + "─" * (w - 2) + "┐", curses.A_DIM)
+            for i in range(1, h - 1):
+                self.stdscr.addstr(y + i, x, "│", curses.A_DIM)
+                self.stdscr.addstr(y + i, x + w - 1, "│", curses.A_DIM)
+            self.stdscr.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.A_DIM)
+            if title:
+                self.stdscr.addstr(y, x + 2, f" {title} ", curses.A_BOLD)
+        except Exception:
+            pass
+
+    def mattr(self, kind: str) -> int:
+        import curses
+        if kind in ("sel", "title"):
+            return curses.A_REVERSE | curses.A_BOLD
+        if kind == "hint":
+            return curses.A_DIM
+        return curses.A_BOLD
+
+    def render(self, now: float) -> None:
+        import curses
+        stdscr = self.stdscr
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        min_w, min_h = 64, MH + 6
+        if maxx < min_w or maxy < min_h:
+            for i, line in enumerate([
+                    "Terminal too small for Cakeman.",
+                    f"Need at least {min_w}x{min_h}, you have {maxx}x{maxy}.",
+                    "Resize or press Q to quit."]):
+                try:
+                    stdscr.addstr(maxy // 2 - 1 + i, max(0, (maxx - len(line)) // 2),
+                                  line, curses.A_BOLD)
+                except Exception:
+                    pass
+            stdscr.refresh()
+            return
+
+        e = self.engine
+        sk = self.skin()
+        panel_w = 22
+        total_w = panel_w + MW + panel_w + 6
+        ox = max(0, (maxx - total_w) // 2)
+        oy = max(1, (maxy - (MH + 3)) // 2)
+        lx, mx, rx = ox, ox + panel_w + 3, ox + panel_w + 3 + MW + 3
+
+        try:
+            stdscr.addstr(max(0, oy - 1), max(0, (maxx - 13) // 2), " C A K E M A N ",
+                          curses.A_BOLD | self.pair("player"))
+        except Exception:
+            pass
+
+        # maze frame
+        for r in range(MH):
+            sy = oy + 1 + r
+            for c in range(MW):
+                ch = MAZE[r][c]
+                sx = mx + c
+                if ch == "#":
+                    self.put(sx, sy, sk["wall"], self.pair("maze") | curses.A_BOLD)
+                elif ch == "-":
+                    self.put(sx, sy, "–", self.pair("maze") | curses.A_DIM)
+                else:
+                    self.put(sx, sy, " ", 0)
+        # crumbs
+        for (x, y) in e.pellets:
+            self.put(mx + x, oy + 1 + y, sk["pellet"], self.pair("pellet"))
+        blink = int(now * 3) % 2 == 0
+        for (x, y) in e.powers:
+            self.put(mx + x, oy + 1 + y, sk["power"],
+                     (self.pair("pellet") | curses.A_BOLD) if blink else self.pair("pellet"))
+        # player (skip over frightened-ghost overlap: ghost drawn below wins ties
+        # only when edible — actually draw player first, then ghosts)
+        if not e.game_over:
+            frame = 0 if int(self.mouth * 6) % 2 == 0 else 1
+            px, py = e.player["pos"]
+            if 0 <= px < MW and 0 <= py < MH:
+                try:
+                    stdscr.addstr(oy + 1 + py, mx + px, sk["player"][frame],
+                                  self.pair("player") | curses.A_BOLD)
+                except Exception:
+                    pass
+        # ghosts
+        for i, g in enumerate(e.ghosts):
+            x, y = g["pos"]
+            if not (0 <= x < MW and 0 <= y < MH):
+                continue
+            st = g["state"]
+            if st == "fright":
+                ch, attr = sk["fright"], self.pair("fright") | curses.A_BOLD
+            elif st == "eyes":
+                ch, attr = sk["eyes"], self.pair("pellet")
+            else:
+                ch, attr = sk["ghosts"][i], self.pair(f"g{i}") | curses.A_BOLD
+            try:
+                stdscr.addstr(oy + 1 + y, mx + x, ch, attr)
+            except Exception:
+                pass
+
+        # left panel: score
+        self.text_box(lx, oy, panel_w, 11, "CAKEMAN")
+        for i, s in enumerate([
+                f"Score  {e.score:>9,}",
+                f"Best   {max(self.highscore, e.score):>9,}",
+                f"Lives  {'♥' * e.lives + '·' * max(0, 3 - e.lives):>9}",
+                f"Level  {e.level:>9}",
+                f"Crumbs {len(e.pellets) + len(e.powers):>8}/{e.total_crumbs:<3}",
+                f"Mode   {(('FRIGHT!' if e.fright_timer > 0 else e.mode.upper())):>9}",
+        ]):
+            self.put(lx + 2, oy + 2 + i, s[: panel_w - 3])
+        # legend shows the active skin's characters
+        self.text_box(lx, oy + 12, panel_w, 7, f"SKIN: {self.skin_name.upper()}")
+        self.put(lx + 2, oy + 14, f"You {sk['player'][0]}  foe {sk['fright']}")
+        self.put(lx + 2, oy + 15, " ".join(sk["ghosts"]) + "  ghosts")
+        self.put(lx + 2, oy + 16, f"{sk['pellet']} crumb  {sk['power']} power")
+
+        # right panel: help
+        ry = oy
+        self.text_box(rx, ry, panel_w, 12, "HELP")
+        for i, s in enumerate([
+                "Arrows/WASD move", "turns are buffered", "eat all crumbs!",
+                f"{sk['power']} = hunt ghosts", "ghosts pay 200→1600",
+                "ESC menu  R restart", "Q quit  M colors",
+        ]):
+            self.put(rx + 2, ry + 2 + i, s[: panel_w - 3])
+
+        try:
+            status = self.status_line(now)
+            stdscr.addstr(maxy - 1, max(0, (maxx - len(status)) // 2),
+                          status[: maxx - 1], curses.A_DIM)
+        except Exception:
+            pass
+
+        if self.menu_open:
+            if self.in_settings:
+                self.draw_settings_menu()
+            else:
+                self.draw_pause_menu()
+        elif e.game_over:
+            self.draw_gameover_menu()
+        elif e.ready_timer > 0:
+            self.center_banner("READY!" if e.lives == 3 and e.level == 1 and e.score == 0
+                               else ("LEVEL %d" % e.level))
+
+        stdscr.refresh()
+
+    def status_line(self, now: float) -> str:
+        e = self.engine
+        if e.game_over:
+            return "Game over — ←→ choose · Enter select · Q quit"
+        if self.menu_open:
+            return "Menu — ↑↓ choose · Enter select · ESC continue"
+        return (f"{e.score:,} pts · Lv {e.level} · ♥×{e.lives} · "
+                f"{self.skin_name}/{self.theme_name} · ESC menu")
+
+    def center_banner(self, text: str) -> None:
+        import curses
+        maxy, maxx = self.stdscr.getmaxyx()
+        try:
+            self.stdscr.addstr(maxy // 2, (maxx - len(text)) // 2, text,
+                               curses.A_REVERSE | curses.A_BOLD)
+        except Exception:
+            pass
+
+    # -- menus (same white/reverse look as caketris) ------------------------------
+    def menu_button(self, y: int, x: int, label: str, selected: bool,
+                    bid: str) -> int:
+        text = f"[ {label} ]"
+        if selected:
+            text = f"[▶ {label} ]"
+        w = len(text)
+        try:
+            self.stdscr.addstr(y, x, text, self.mattr("sel") if selected
+                               else self.mattr("text"))
+        except Exception:
+            pass
+        self._menu_buttons.append((bid, y, x, w))
+        return w
+
+    def menu_panel(self, title: str, inner_h: int, inner_w: int):
+        maxy, maxx = self.stdscr.getmaxyx()
+        w, h = inner_w + 6, inner_h + 4
+        x0, y0 = max(0, (maxx - w) // 2), max(0, (maxy - h) // 2)
+        try:
+            self.stdscr.addstr(y0, x0, "┌" + "─" * (w - 2) + "┐", self.mattr("text"))
+            for yy in range(y0 + 1, y0 + h - 1):
+                self.stdscr.addstr(yy, x0, "│", self.mattr("text"))
+                self.stdscr.addstr(yy, x0 + w - 1, "│", self.mattr("text"))
+            self.stdscr.addstr(y0 + h - 1, x0, "└" + "─" * (w - 2) + "┘",
+                               self.mattr("text"))
+            self.stdscr.addstr(y0 + 1, x0 + (w - len(title)) // 2, title,
+                               self.mattr("title"))
+        except Exception:
+            pass
+        return x0, y0
+
+    def draw_pause_menu(self) -> None:
+        self._menu_buttons = []
+        e = self.engine
+        inner_w = 30
+        x0, y0 = self.menu_panel(f"Ⅱ PAUSED — {e.score:,} pts",
+                                 len(self.menu_items) + 3, inner_w)
+        try:
+            for i, item in enumerate(self.menu_items):
+                self.menu_button(y0 + 3 + i,
+                                 x0 + (inner_w + 6 - (len(item) + 6)) // 2,
+                                 f"{i + 1}. {item}", i == self.menu_index,
+                                 f"menu_{i}")
+            hint = "↑↓ navigate · Enter select · ESC continue"
+            self.stdscr.addstr(y0 + 3 + len(self.menu_items) + 1,
+                               x0 + (inner_w + 6 - len(hint)) // 2, hint,
+                               self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_settings_menu(self) -> None:
+        rows = self.settings_rows()
+        inner_w = 36
+        x0, y0 = self.menu_panel("⚙ SETTINGS", len(rows) + 3, inner_w)
+        hint = "↑↓ row · ←→ change · ESC back"
+        hy, hx = y0 + 3 + len(rows) + 1, x0 + (inner_w + 6 - len(hint)) // 2
+        self._menu_buttons = [("set_back", hy, hx, len(hint))]
+        try:
+            for i, (name, val) in enumerate(rows):
+                by = y0 + 3 + i
+                marker = "▶" if i == self.settings_index else " "
+                self.stdscr.addstr(by, x0 + 3, f"{marker} {name}"[:22].ljust(22),
+                                   self.mattr("sel") if i == self.settings_index
+                                   else self.mattr("text"))
+                self.stdscr.addstr(by, x0 + 3 + 23, f"< {val} >",
+                                   self.mattr("title"))
+            self.stdscr.addstr(hy, hx, hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_gameover_menu(self) -> None:
+        e = self.engine
+        hs = max(self.highscore, e.score)
+        title = "GAME OVER" + ("  ★ NEW BEST!" if self.new_high else "")
+        stats = [f"Score  {e.score:,}", f"Level  {e.level}", f"Best   {hs:,}"]
+        inner_w = 32
+        x0, y0 = self.menu_panel(title, len(stats) + 4, inner_w)
+        by = y0 + 3 + len(stats) + 1
+        b0 = "[▶ Restart ]" if self.over_index == 0 else "[ Restart ]"
+        b1 = "[▶ Quit ]" if self.over_index == 1 else "[ Quit ]"
+        gap = 4
+        bx = x0 + (inner_w + 6 - (len(b0) + gap + len(b1))) // 2
+        self._menu_buttons = [("over_restart", by, bx, len(b0)),
+                              ("over_quit", by, bx + len(b0) + gap, len(b1))]
+        try:
+            for i, s in enumerate(stats):
+                self.stdscr.addstr(y0 + 3 + i, x0 + (inner_w + 6 - len(s)) // 2,
+                                   s, self.mattr("title"))
+            self.stdscr.addstr(by, bx, b0, self.mattr("sel") if self.over_index == 0
+                               else self.mattr("text"))
+            self.stdscr.addstr(by, bx + len(b0) + gap, b1,
+                               self.mattr("sel") if self.over_index == 1
+                               else self.mattr("text"))
+            hint = "←→ choose · Enter select · R restart"
+            self.stdscr.addstr(by + 2, x0 + (inner_w + 6 - len(hint)) // 2,
+                               hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Cakeman — Pac-Man-style terminal chase")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed")
+    parser.add_argument("--speed", choices=SPEED_NAMES, default=None,
+                        help="game speed (overrides saved setting)")
+    parser.add_argument("--mono", action="store_true", help="disable colors")
+    parser.add_argument("--test", action="store_true", help="run headless self-test and exit")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_selftest()
+
+    try:
+        import curses  # noqa
+    except Exception as exc:
+        if os.name == "nt":
+            print("This game needs curses. On Windows:\n  pip install windows-curses",
+                  file=sys.stderr)
+            return 2
+        print(f"curses is required: {exc}", file=sys.stderr)
+        return 2
+    import curses
+
+    def _wrapped(stdscr):
+        CursesApp(stdscr, args).run()
+
+    try:
+        curses.wrapper(_wrapped)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Headless self-test
+# --------------------------------------------------------------------------
+
+def run_selftest() -> int:
+    fails = []
+
+    def check(name: str, cond: bool, detail: str = ""):
+        print(("PASS " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    # 1. maze rectangular + symmetric + bordered (tunnel row excepted)
+    check("maze-rect", all(len(r) == MW for r in MAZE), str([len(r) for r in MAZE]))
+    check("maze-sym", all(r == r[::-1] for r in MAZE))
+    bad = [i for i, r in enumerate(MAZE)
+           if not (r[0] in "# " and r[-1] in "# ")]
+    check("maze-border", not bad, str(bad))
+    # 2. crumbs exist, house + door sane
+    e = PacEngine(seed=1)
+    e.ready_timer = 0
+    check("crumbs-exist", len(e.pellets) > 150 and len(e.powers) == 4,
+          f"{len(e.pellets)} pellets, {len(e.powers)} powers")
+    check("house-door", all(MAZE[y][x] == "-" for (x, y) in DOOR))
+    # 3. walls block movement
+    e.player["pos"] = (1, 1)
+    e.player["dir"] = e.player["buf"] = "left"
+    e._step_player()
+    check("wall-blocks", e.player["pos"] == (1, 1))
+    # 4. eating a pellet scores
+    e.player["pos"] = (1, 1)
+    e.player["dir"] = e.player["buf"] = "right"
+    s0 = e.score
+    e._step_player()  # (2,1) has a pellet
+    check("pellet-scores", e.score == s0 + 10 and (2, 1) not in e.pellets)
+    # 5. power treat -> fright
+    e2 = PacEngine(seed=2)
+    e2.ready_timer = 0
+    e2.player["pos"] = (1, 2)
+    e2.player["dir"] = e2.player["buf"] = "down"  # (1,3) is a power treat
+    e2._step_player()
+    check("power-fright", e2.fright_timer > 0 and
+          all(g["state"] in ("fright", "house", "leaving") for g in e2.ghosts),
+          f"fright={e2.fright_timer}")
+    # 6. frightened ghost eaten -> eyes + 200 pts chain
+    e3 = PacEngine(seed=3)
+    e3.ready_timer = 0
+    e3.ghosts[0]["pos"] = e3.player["pos"] = (9, 15)
+    e3.ghosts[0]["state"] = "fright"
+    s0 = e3.score
+    e3._collisions()
+    check("ghost-eaten", e3.ghosts[0]["state"] == "eyes" and e3.score == s0 + 200)
+    # 7. normal ghost touch -> lose a life
+    e4 = PacEngine(seed=4)
+    e4.ready_timer = 0
+    e4.ghosts[1]["pos"] = e4.player["pos"] = (9, 15)
+    e4.ghosts[1]["state"] = "active"
+    e4._collisions()
+    check("death-costs-life", e4.lives == 2 and e4.player["pos"] == PLAYER_START)
+    # 8. tunnel wraps
+    e5 = PacEngine(seed=5)
+    e5.ready_timer = 0
+    e5.player["pos"] = (0, 10)
+    e5.player["dir"] = e5.player["buf"] = "left"
+    e5._step_player()
+    check("tunnel-wraps", e5.player["pos"] == (MW - 1, 10), str(e5.player["pos"]))
+    # 9. clearing crumbs -> next level
+    e6 = PacEngine(seed=6)
+    e6.ready_timer = 0
+    e6.pellets.clear()
+    e6.powers.clear()
+    e6.powers.add((9, 15))
+    e6.player["pos"] = (8, 15)
+    e6.player["dir"] = e6.player["buf"] = "right"
+    lv = e6.level
+    e6._step_player()
+    check("level-clear", e6.level == lv + 1 and len(e6.pellets) > 100)
+    # 10. ghost personalities target different tiles
+    e7 = PacEngine(seed=7)
+    e7.ready_timer = 0
+    e7.player["pos"] = (9, 15)
+    e7.player["dir"] = "left"
+    e7.mode = "chase"
+    targets = {e7._ghost_target(g) for g in e7.ghosts}
+    check("personalities-differ", len(targets) >= 3, str(targets))
+    # 11. skins/themes valid: distinct chars, real color names
+    ok = True
+    for name, sk in SKINS.items():
+        chars = [sk["player"][0]] + sk["ghosts"]
+        if len(set(chars)) < 5:
+            ok = False
+        for k in ("fright", "eyes", "pellet", "power", "wall"):
+            if len(sk[k]) != 1:
+                ok = False
+    check("skins-distinct", ok)
+    ok = all(set(t) == {"maze", "player", "ghosts", "pellet"} and len(t["ghosts"]) == 4
+             for t in THEMES.values())
+    check("themes-valid", ok)
+    # 12. update() runs without errors for a while
+    e8 = PacEngine(seed=8)
+    e8.ready_timer = 0
+    try:
+        for i in range(3000):
+            if i % 3 == 0:
+                e8.steer(["up", "left", "down", "right"][i % 4])
+            e8.update(0.03)
+        check("soak-no-crash", True)
+    except Exception as exc:
+        check("soak-no-crash", False, str(exc))
+
+    total = 12
+    print(f"\n{total - len(fails)}/{total} checks passed.")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
