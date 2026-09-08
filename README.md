@@ -97,7 +97,7 @@ change the next-preview count (1–5), and reset the best score.
 - Guideline scoring: 100/300/500/800 × level, 1.5× back-to-back Tetris
   bonus, combo bonus, soft/hard-drop points
 - Level every 10 lines with real gravity curve + progress bar
-- Lock delay, line-clear flash, colored pause/settings/game-over menus
+- Lock delay, line-clear flash, clean pause/settings/game-over menus
 - Live stats and persistent best score in `~/.caketris_highscore.json`
 
 ## Requirements

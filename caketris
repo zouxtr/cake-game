@@ -493,20 +493,19 @@ def _init_colors() -> dict[str, int]:
         curses.init_pair(21, curses.COLOR_BLACK, curses.COLOR_WHITE)
     except Exception:
         pass
-    # menu palette (deep-blue panel, glowing accents)
-    menu_defs = {
-        30: (curses.COLOR_WHITE, curses.COLOR_BLUE),   # panel background
-        31: (curses.COLOR_YELLOW, curses.COLOR_BLUE),  # titles / values
-        32: (curses.COLOR_BLACK, curses.COLOR_CYAN),   # selected button
-        33: (curses.COLOR_CYAN, curses.COLOR_BLUE),    # hints / secondary
-        34: (curses.COLOR_YELLOW, curses.COLOR_BLUE),  # borders
-    }
-    for pid, (fg, bg) in menu_defs.items():
-        try:
-            curses.init_pair(pid, fg, bg)
-        except Exception:
-            pass
+    # menu palette: deliberately NOT blue — menus use the terminal's own
+    # colors with reverse-video highlights (same look as --mono).
+    # pair 35 is the solid-white block used for pieces in mono mode
+    # (spaces show the background color, so white blocks need a white bg).
+    try:
+        curses.init_pair(35, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    except Exception:
+        pass
     return pairs
+
+
+# Set by CursesApp when mono mode is on/off (draw_block can't see the app).
+_MONO = False
 
 
 def draw_block(win, y: int, x: int, color_pair: int, ghost: bool = False,
@@ -515,6 +514,13 @@ def draw_block(win, y: int, x: int, color_pair: int, ghost: bool = False,
     try:
         if flash:
             win.addstr(y, x, "  ", curses.color_pair(21) | curses.A_BOLD)
+        elif _MONO:
+            # Mono mode: everything white, no blue anywhere. Solid white
+            # blocks (pair 35 = black on white), dim white ghosts.
+            if ghost:
+                win.addstr(y, x, "░░", curses.color_pair(20) | curses.A_DIM)
+            else:
+                win.addstr(y, x, "  ", curses.color_pair(35) | curses.A_BOLD)
         elif ghost:
             # hollow ghost: dim outline using brackets
             win.addstr(y, x, "░░", curses.color_pair(color_pair) | curses.A_DIM)
@@ -604,6 +610,8 @@ class CursesApp:
         self.apply_color_mode()
 
     def apply_color_mode(self) -> None:
+        global _MONO
+        _MONO = bool(self.mono)
         if self.mono:
             self.pairs = {k: 20 for k in self.pairs}
         else:
@@ -863,8 +871,7 @@ class CursesApp:
         except Exception:
             pass
         self.pairs = _init_colors()
-        if self.mono:
-            self.pairs = {k: 20 for k in self.pairs}
+        self.apply_color_mode()
 
         prev = time.monotonic()
         while True:
@@ -1125,31 +1132,17 @@ class CursesApp:
 
     # -- pause / settings / game-over menus (keyboard + mouse) -------------
     def _mattr(self, kind: str) -> int:
-        """Menu color attribute. Falls back gracefully in mono/no-color."""
+        """Menu styling: terminal's own colors + reverse-video highlights.
+
+        Identical in color and mono mode (no blue panel) — plain, bright,
+        and readable on dark and light terminals alike.
+        """
         import curses
-        if self.mono:
-            if kind in ("sel", "title"):
-                return curses.A_REVERSE | curses.A_BOLD
-            return curses.A_BOLD
-        try:
-            if kind == "bg":
-                return curses.color_pair(30)
-            if kind == "title":
-                return curses.color_pair(31) | curses.A_BOLD
-            if kind == "sel":
-                return curses.color_pair(32) | curses.A_BOLD
-            if kind == "hint":
-                return curses.color_pair(33) | curses.A_DIM
-            if kind == "border":
-                return curses.color_pair(34) | curses.A_BOLD
-            if kind == "text":
-                return curses.color_pair(30) | curses.A_BOLD
-            if kind == "value":
-                return curses.color_pair(31) | curses.A_BOLD
-        except Exception:
-            pass
-        import curses as _c
-        return _c.A_BOLD
+        if kind in ("sel", "title"):
+            return curses.A_REVERSE | curses.A_BOLD
+        if kind == "hint":
+            return curses.A_DIM
+        return curses.A_BOLD
 
     def menu_button(self, y: int, x: int, label: str, selected: bool,
                     bid: str) -> int:
