@@ -1,0 +1,1413 @@
+#!/usr/bin/env python3
+"""
+Caketris — a polished Tetris for the Linux terminal.
+
+  caketris            # play
+  caketris --help     # options
+
+Controls (default):
+  ← / →  or  H / L   move (exactly one cell per press)
+  ↓ / S / J          hold for fast fall (soft drop, +1/cell)
+  ↑ / X / W          rotate clockwise
+  Z                  rotate counter-clockwise
+  A                  rotate 180
+  SPACE              hard drop
+  C                  hold
+  ESC / P            pause menu (Continue · Restart · Settings · Quit)
+  R                  quick restart
+  Q                  quit
+  M                  toggle ghost piece
+
+Pause menu: ↑↓ + Enter (mouse-clickable where supported).
+Settings: ghost piece, color/mono, next-preview count, reset best score.
+
+Features: 7-bag randomizer, SRS-style wall kicks, ghost piece, hold,
+5-piece preview, levels + gravity curve, guideline scoring with
+combo + back-to-back, lock delay, one-cell-per-press movement (terminal
+key-repeat handles holding), soft/hard drop scoring, line-clear flash,
+ESC pause menu (continue/restart/settings/quit) + game-over menu,
+persistent high score, centered responsive layout, color + monochrome.
+Requires only the Python standard library (curses).
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import random
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Config / tuning
+# --------------------------------------------------------------------------
+
+WIDTH = 10
+HEIGHT = 20
+VISIBLE_NEXT = 5
+
+DAS = 0.150   # legacy (unused): movement is 1 cell per key event now
+ARR = 0.045   # legacy (unused): holding relies on terminal key-repeat
+SOFT_DROP_INTERVAL = 0.08  # seconds per row while Down held (~12 rows/s).
+# Tune this one number to taste: smaller = faster soft drop.
+LOCK_DELAY = 0.50
+MAX_LOCK_RESETS = 15
+LINE_FLASH_TIME = 0.18
+
+# Guideline-ish gravity: seconds per row per level (1..15+)
+def gravity_for_level(level: int) -> float:
+    level = max(1, level)
+    if level in _GRAVITY_CACHE:
+        return _GRAVITY_CACHE[level]
+    # classic formula (0.8 - (lvl-1)*0.007) ** (lvl-1), clamped
+    g = (0.8 - (level - 1) * 0.007) ** (level - 1)
+    g = max(0.015, min(0.8, g))
+    _GRAVITY_CACHE[level] = g
+    return g
+
+_GRAVITY_CACHE: dict[int, float] = {1: 0.8, 2: 0.72, 3: 0.63, 4: 0.55,
+    5: 0.47, 6: 0.38, 7: 0.30, 8: 0.22, 9: 0.15, 10: 0.10}
+
+LINE_SCORES = {0: 0, 1: 100, 2: 300, 3: 500, 4: 800}
+
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".caketris_highscore.json")
+
+# Piece colors -> curses color index (mapped later). 1..7
+PIECE_IDS = {"I": 1, "O": 2, "T": 3, "S": 4, "Z": 5, "J": 6, "L": 7}
+ID_TO_PIECE = {v: k for k, v in PIECE_IDS.items()}
+
+# Explicit rotation states: each is a list of (x, y) cells inside a
+# bounding box (4x4 for I, 2x2 for O, 3x3 for the rest).
+SHAPES: dict[str, list[list[tuple[int, int]]]] = {
+    "I": [
+        [(0, 1), (1, 1), (2, 1), (3, 1)],
+        [(2, 0), (2, 1), (2, 2), (2, 3)],
+        [(0, 2), (1, 2), (2, 2), (3, 2)],
+        [(1, 0), (1, 1), (1, 2), (1, 3)],
+    ],
+    "O": [
+        [(1, 0), (2, 0), (1, 1), (2, 1)],
+        [(1, 0), (2, 0), (1, 1), (2, 1)],
+        [(1, 0), (2, 0), (1, 1), (2, 1)],
+        [(1, 0), (2, 0), (1, 1), (2, 1)],
+    ],
+    "T": [
+        [(1, 0), (0, 1), (1, 1), (2, 1)],
+        [(1, 0), (1, 1), (2, 1), (1, 2)],
+        [(0, 1), (1, 1), (2, 1), (1, 2)],
+        [(1, 0), (0, 1), (1, 1), (1, 2)],
+    ],
+    "S": [
+        [(1, 0), (2, 0), (0, 1), (1, 1)],
+        [(1, 0), (1, 1), (2, 1), (2, 2)],
+        [(1, 1), (2, 1), (0, 2), (1, 2)],
+        [(0, 0), (0, 1), (1, 1), (1, 2)],
+    ],
+    "Z": [
+        [(0, 0), (1, 0), (1, 1), (2, 1)],
+        [(2, 0), (1, 1), (2, 1), (1, 2)],
+        [(0, 1), (1, 1), (1, 2), (2, 2)],
+        [(1, 0), (0, 1), (1, 1), (0, 2)],
+    ],
+    "J": [
+        [(0, 0), (0, 1), (1, 1), (2, 1)],
+        [(1, 0), (2, 0), (1, 1), (1, 2)],
+        [(0, 1), (1, 1), (2, 1), (2, 2)],
+        [(1, 0), (1, 1), (0, 2), (1, 2)],
+    ],
+    "L": [
+        [(2, 0), (0, 1), (1, 1), (2, 1)],
+        [(1, 0), (1, 1), (1, 2), (2, 2)],
+        [(0, 1), (1, 1), (2, 1), (0, 2)],
+        [(0, 0), (1, 0), (1, 1), (1, 2)],
+    ],
+}
+
+SPAWN_X = {"I": 3, "O": 3, "T": 3, "S": 3, "Z": 3, "J": 3, "L": 3}
+SPAWN_Y = 0
+
+# Generic wall-kick offsets tried in order (good enough for casual play,
+# includes ±2 for I-piece). SRS purists get 95% of the behavior.
+KICKS_GENERIC = [(0, 0), (-1, 0), (1, 0), (0, -1), (-1, -1), (1, -1),
+                 (0, 1), (-2, 0), (2, 0), (-1, 1), (1, 1), (0, -2)]
+KICKS_I = [(0, 0), (-2, 0), (2, 0), (-1, 0), (1, 0), (0, -1), (0, 1),
+           (-2, -1), (2, 1), (-1, -1), (1, 1)]
+
+
+# --------------------------------------------------------------------------
+# Engine (no curses here — fully testable headless)
+# --------------------------------------------------------------------------
+
+class Piece:
+    def __init__(self, kind: str, rot: int = 0, x: int = 0, y: int = 0):
+        self.kind = kind
+        self.rot = rot % 4
+        self.x = x
+        self.y = y
+
+    def cells(self, rot: int | None = None, x: int | None = None,
+              y: int | None = None) -> list[tuple[int, int]]:
+        r = self.rot if rot is None else rot % 4
+        ox = self.x if x is None else x
+        oy = self.y if y is None else y
+        return [(ox + cx, oy + cy) for (cx, cy) in SHAPES[self.kind][r]]
+
+    def copy(self) -> "Piece":
+        return Piece(self.kind, self.rot, self.x, self.y)
+
+
+class TetrisEngine:
+    """Pure game logic. UI-agnostic; time expressed in seconds."""
+
+    def __init__(self, seed: int | None = None):
+        self.rng = random.Random(seed)
+        self.board: list[list[int]] = [[0] * WIDTH for _ in range(HEIGHT)]
+        self.bag: list[str] = []
+        self.next_queue: list[str] = []
+        self.current: Piece | None = None
+        self.hold_kind: str | None = None
+        self.can_hold = True
+        self.score = 0
+        self.lines = 0
+        self.level = 1
+        self.combo = -1  # -1 = no combo; incremented on consecutive clears
+        self.b2b = False  # back-to-back Tetris bonus active
+        self.pieces = 0
+        self.game_over = False
+        self.fall_timer = 0.0
+        self.lock_timer = 0.0
+        self.lock_resets = 0
+        self.on_ground = False
+        self.clearing_rows: list[int] = []
+        self.clear_timer = 0.0
+        self.last_clear_was_difficult = False
+        self._refill_queue()
+        self.spawn_piece()
+
+    # -- bag / queue ------------------------------------------------------
+    def _refill_queue(self) -> None:
+        while len(self.next_queue) < 7:
+            if not self.bag:
+                self.bag = list(SHAPES.keys())
+                self.rng.shuffle(self.bag)
+            self.next_queue.append(self.bag.pop())
+
+    def _pop_next(self) -> str:
+        self._refill_queue()
+        kind = self.next_queue.pop(0)
+        self._refill_queue()
+        return kind
+
+    # -- collision --------------------------------------------------------
+    def collides(self, piece: Piece, rot=None, x=None, y=None) -> bool:
+        for (cx, cy) in piece.cells(rot, x, y):
+            if cx < 0 or cx >= WIDTH or cy >= HEIGHT:
+                return True
+            if cy >= 0 and self.board[cy][cx]:
+                return True
+        return False
+
+    # -- spawn ------------------------------------------------------------
+    def spawn_piece(self, kind: str | None = None) -> bool:
+        kind = kind or self._pop_next()
+        p = Piece(kind, 0, SPAWN_X[kind], SPAWN_Y)
+        # nudge O piece (4-wide box) one left so it is centered
+        if kind == "O":
+            p.x = 3
+        # spawn slightly above if blocked: try y=-1 then game over
+        if self.collides(p):
+            p.y -= 1
+            if self.collides(p):
+                self.current = p
+                self.game_over = True
+                return False
+        self.current = p
+        self.fall_timer = 0.0
+        self.lock_timer = 0.0
+        self.lock_resets = 0
+        self.on_ground = False
+        self.can_hold = self.can_hold  # unchanged; reset on lock
+        return True
+
+    # -- movement ---------------------------------------------------------
+    def move(self, dx: int, dy: int) -> bool:
+        if not self.current or self.game_over:
+            return False
+        p = self.current
+        if not self.collides(p, x=p.x + dx, y=p.y + dy):
+            p.x += dx
+            p.y += dy
+            if dx != 0 and self.on_ground:
+                self._bump_lock()
+            if dy != 0:
+                pass
+            self._update_grounded()
+            return True
+        if dy > 0:
+            self._update_grounded()
+        return False
+
+    def _update_grounded(self) -> None:
+        if not self.current:
+            return
+        p = self.current
+        grounded = self.collides(p, y=p.y + 1)
+        if grounded and not self.on_ground:
+            self.on_ground = True
+            self.lock_timer = 0.0
+        elif not grounded:
+            self.on_ground = False
+            self.lock_timer = 0.0
+
+    def _bump_lock(self) -> None:
+        if self.lock_resets < MAX_LOCK_RESETS:
+            self.lock_timer = 0.0
+            self.lock_resets += 1
+
+    def rotate(self, direction: int) -> bool:
+        """direction: +1 cw, -1 ccw, 2 = 180."""
+        if not self.current or self.game_over:
+            return False
+        p = self.current
+        new_rot = (p.rot + direction) % 4
+        kicks = KICKS_I if p.kind == "I" else KICKS_GENERIC
+        for (kx, ky) in kicks:
+            if not self.collides(p, rot=new_rot, x=p.x + kx, y=p.y + ky):
+                p.rot = new_rot
+                p.x += kx
+                p.y += ky
+                if self.on_ground:
+                    self._bump_lock()
+                self._update_grounded()
+                return True
+        return False
+
+    def ghost_y(self) -> int:
+        if not self.current:
+            return 0
+        p = self.current
+        y = p.y
+        while not self.collides(p, y=y + 1):
+            y += 1
+        return y
+
+    def hard_drop(self) -> int:
+        if not self.current or self.game_over:
+            return 0
+        dist = self.ghost_y() - self.current.y
+        self.current.y += dist
+        self.score += dist * 2
+        self.lock_piece()
+        return dist
+
+    def soft_drop_step(self) -> bool:
+        if self.move(0, 1):
+            self.score += 1
+            return True
+        return False
+
+    def hold(self) -> bool:
+        if not self.current or not self.can_hold or self.game_over:
+            return False
+        cur = self.current.kind
+        if self.hold_kind is None:
+            self.hold_kind = cur
+            self.spawn_piece()
+        else:
+            tmp = self.hold_kind
+            self.hold_kind = cur
+            p = Piece(tmp, 0, SPAWN_X[tmp], SPAWN_Y)
+            if tmp == "O":
+                p.x = 3
+            if self.collides(p):
+                p.y -= 1
+                if self.collides(p):
+                    self.current = p
+                    self.game_over = True
+                    return True
+            self.current = p
+            self.fall_timer = 0.0
+            self.lock_timer = 0.0
+            self.lock_resets = 0
+            self.on_ground = False
+        self.can_hold = False
+        self._update_grounded()
+        return True
+
+    # -- locking / clearing ----------------------------------------------
+    def lock_piece(self) -> list[int]:
+        """Write current piece to board, clear lines, spawn next. Returns cleared rows."""
+        if not self.current:
+            return []
+        for (cx, cy) in self.current.cells():
+            if cy < 0:
+                self.game_over = True
+                return []
+            self.board[cy][cx] = PIECE_IDS[self.current.kind]
+        self.pieces += 1
+        self.can_hold = True
+        cleared = [r for r in range(HEIGHT) if all(self.board[r])]
+        self._score_clear(len(cleared))
+        for r in cleared:
+            del self.board[r]
+            self.board.insert(0, [0] * WIDTH)
+        # spawn next (unless topped out)
+        if not self.game_over:
+            # block-out / lock-out: game over if spawn collides
+            kind = self._pop_next()
+            p = Piece(kind, 0, SPAWN_X[kind], SPAWN_Y)
+            if kind == "O":
+                p.x = 3
+            if self.collides(p):
+                p.y -= 1
+                if self.collides(p):
+                    self.current = p
+                    self.game_over = True
+                    return cleared
+            self.current = p
+            self.fall_timer = 0.0
+            self.lock_timer = 0.0
+            self.lock_resets = 0
+            self.on_ground = False
+            self._update_grounded()
+        return cleared
+
+    def _score_clear(self, n: int) -> None:
+        if n == 0:
+            self.combo = -1
+            self.last_clear_was_difficult = False
+            return
+        difficult = (n == 4)
+        base = LINE_SCORES[n] * self.level
+        if difficult and self.b2b:
+            base = int(base * 1.5)
+        self.score += base
+        # combo bonus (only from 2nd consecutive clear)
+        if self.combo >= 0:
+            self.score += 50 * (self.combo + 1) * self.level
+        self.combo += 1
+        if difficult:
+            self.b2b = True
+        else:
+            self.b2b = False  # singles/doubles/triples break B2B
+        self.last_clear_was_difficult = difficult
+        self.lines += n
+        self.level = self.lines // 10 + 1
+
+    # -- time step ----------------------------------------------------------
+    def update(self, dt: float, soft_drop_held: bool = False) -> list[int]:
+        """Advance gravity/lock timers. Returns rows just cleared (for flash)."""
+        if self.game_over or not self.current:
+            return []
+        interval = SOFT_DROP_INTERVAL if soft_drop_held else gravity_for_level(self.level)
+        self.fall_timer += dt
+        cleared_now: list[int] = []
+        while self.fall_timer >= interval:
+            self.fall_timer -= interval
+            if self.collides(self.current, y=self.current.y + 1):
+                break
+            self.current.y += 1
+            if soft_drop_held:
+                self.score += 1
+        self._update_grounded()
+        if self.on_ground:
+            self.lock_timer += dt
+            if self.lock_timer >= LOCK_DELAY:
+                cleared_now = self.lock_piece()
+                self.clearing_rows = cleared_now
+                self.clear_timer = LINE_FLASH_TIME if cleared_now else 0.0
+        else:
+            self.lock_timer = 0.0
+        if self.clear_timer > 0:
+            self.clear_timer -= dt
+            if self.clear_timer <= 0:
+                self.clearing_rows = []
+        return cleared_now
+
+
+# --------------------------------------------------------------------------
+# High score persistence
+# --------------------------------------------------------------------------
+
+def load_highscore() -> int:
+    try:
+        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return int(data.get("highscore", 0))
+    except Exception:
+        return 0
+
+
+def save_highscore(score: int) -> None:
+    try:
+        prev = load_highscore()
+        if score <= prev:
+            return
+        with open(HIGHSCORE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"highscore": int(score)}, f)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Curses UI
+# --------------------------------------------------------------------------
+
+CELL_W = 2  # each board cell is 2 terminal columns wide ("  ")
+
+def _init_colors() -> dict[str, int]:
+    import curses
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except Exception:
+        pass
+    # pair id -> (fg, bg)
+    defs = {
+        1: (curses.COLOR_CYAN, -1),     # I
+        2: (curses.COLOR_YELLOW, -1),   # O
+        3: (curses.COLOR_MAGENTA, -1),  # T
+        4: (curses.COLOR_GREEN, -1),    # S
+        5: (curses.COLOR_RED, -1),      # Z
+        6: (curses.COLOR_BLUE, -1),     # J
+        7: (curses.COLOR_WHITE, -1),    # L
+    }
+    pairs: dict[str, int] = {}
+    for pid, (fg, bg) in defs.items():
+        try:
+            curses.init_pair(pid, fg, bg)
+            curses.init_pair(pid + 10, curses.COLOR_BLACK, fg)
+        except Exception:
+            pass
+        pairs[ID_TO_PIECE[pid]] = pid
+    # extra pairs: 20 text dim, 21 flash, 22 border
+    for pid, fg in ((20, curses.COLOR_WHITE), (21, curses.COLOR_BLACK),
+                    (22, curses.COLOR_CYAN), (23, curses.COLOR_YELLOW)):
+        try:
+            curses.init_pair(pid, fg, -1)
+        except Exception:
+            pass
+    try:
+        curses.init_pair(21, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    except Exception:
+        pass
+    # menu palette (deep-blue panel, glowing accents)
+    menu_defs = {
+        30: (curses.COLOR_WHITE, curses.COLOR_BLUE),   # panel background
+        31: (curses.COLOR_YELLOW, curses.COLOR_BLUE),  # titles / values
+        32: (curses.COLOR_BLACK, curses.COLOR_CYAN),   # selected button
+        33: (curses.COLOR_CYAN, curses.COLOR_BLUE),    # hints / secondary
+        34: (curses.COLOR_YELLOW, curses.COLOR_BLUE),  # borders
+    }
+    for pid, (fg, bg) in menu_defs.items():
+        try:
+            curses.init_pair(pid, fg, bg)
+        except Exception:
+            pass
+    return pairs
+
+
+def draw_block(win, y: int, x: int, color_pair: int, ghost: bool = False,
+               flash: bool = False) -> None:
+    import curses
+    try:
+        if flash:
+            win.addstr(y, x, "  ", curses.color_pair(21) | curses.A_BOLD)
+        elif ghost:
+            # hollow ghost: dim outline using brackets
+            win.addstr(y, x, "░░", curses.color_pair(color_pair) | curses.A_DIM)
+        else:
+            win.addstr(y, x, "  ", curses.color_pair(color_pair + 10) | curses.A_BOLD)
+    except Exception:
+        pass
+
+
+def draw_mini_piece(win, top: int, left: int, kind: str | None,
+                    pairs: dict[str, int], ghost_ok: bool = True) -> None:
+    if kind is None:
+        try:
+            win.addstr(top + 1, left, "  empty  ")
+        except Exception:
+            pass
+        return
+    cells = SHAPES[kind][0]
+    minx = min(c[0] for c in cells)
+    miny = min(c[1] for c in cells)
+    for (cx, cy) in cells:
+        draw_block(win, top + (cy - miny), left + (cx - minx) * CELL_W,
+                   pairs[kind])
+
+
+class CursesApp:
+    def __init__(self, stdscr, args):
+        self.stdscr = stdscr
+        self.args = args
+        self.engine = TetrisEngine(seed=args.seed)
+        self.pairs: dict[str, int] = {}
+        self.paused = False
+        self.show_ghost = not args.no_ghost
+        self.mono = args.mono
+        self.highscore = load_highscore()
+        self.new_high = False
+        self.start_time = time.monotonic()
+        self.elapsed_pause = 0.0
+        self._pause_started = 0.0
+        # Soft-drop held tracking (time-based; works with terminal key-repeat).
+        # NOTE: left/right movement is intentionally ONE cell per key event
+        # with no extra auto-shift layer (the terminal's own key-repeat
+        # handles holding). An earlier DAS/ARR layer caused single taps to
+        # move 2 cells, so it was removed — see apply_autoshift().
+        self.down_held = False
+        self._last_down_event = 0.0
+        # Pause menu / settings state
+        self.menu_open = False
+        self.menu_index = 0
+        self.menu_items = ["Continue", "Restart", "Settings", "Quit"]
+        self.in_settings = False
+        self.settings_index = 0
+        # user settings (preserved across restarts)
+        self.visible_next = VISIBLE_NEXT
+        self._menu_buttons: list[tuple[str, int, int, int]] = []  # (id, y, x, w)
+        self.over_index = 0  # game-over menu selection
+        self.flash_rows: list[int] = []
+        self.flash_until = 0.0
+
+    # -- input ------------------------------------------------------------
+    def open_menu(self, now: float) -> None:
+        if self.engine.game_over:
+            return
+        if not self.menu_open:
+            self.menu_open = True
+            self.in_settings = False
+            self.menu_index = 0
+            if not self.paused:
+                self.toggle_pause(now)
+
+    def close_menu(self, now: float) -> None:
+        self.menu_open = False
+        self.in_settings = False
+        if self.paused:
+            self.toggle_pause(now)
+
+    def restart_keep_settings(self) -> None:
+        """Restart the run but keep user settings + high score state."""
+        args = self.args
+        stdscr = self.stdscr
+        show_ghost, mono, visible_next = self.show_ghost, self.mono, self.visible_next
+        highscore, new_high = self.highscore, self.new_high
+        self.__init__(stdscr, args)
+        self.show_ghost, self.mono, self.visible_next = show_ghost, mono, visible_next
+        self.highscore = highscore
+        self.new_high = new_high
+        self.apply_color_mode()
+
+    def apply_color_mode(self) -> None:
+        if self.mono:
+            self.pairs = {k: 20 for k in self.pairs}
+        else:
+            try:
+                self.pairs = _init_colors()
+            except Exception:
+                pass
+
+    def settings_rows(self) -> list[tuple[str, str]]:
+        return [
+            ("Ghost piece", "ON" if self.show_ghost else "OFF"),
+            ("Colors", "OFF (mono)" if self.mono else "ON"),
+            ("Next preview", str(self.visible_next)),
+            ("Reset best score", "press →"),
+        ]
+
+    def adjust_setting(self, direction: int) -> None:
+        i = self.settings_index
+        if i == 0:
+            self.show_ghost = not self.show_ghost if direction != 0 else self.show_ghost
+        elif i == 1:
+            if direction != 0:
+                self.mono = not self.mono
+                self.apply_color_mode()
+        elif i == 2:
+            self.visible_next = min(5, max(1, self.visible_next + direction))
+        elif i == 3:
+            if direction != 0:
+                self.highscore = 0
+                try:
+                    if os.path.exists(HIGHSCORE_PATH):
+                        os.remove(HIGHSCORE_PATH)
+                except Exception:
+                    pass
+
+    def activate_menu_item(self, now: float) -> str | None:
+        item = self.menu_items[self.menu_index]
+        if item == "Continue":
+            self.close_menu(now)
+        elif item == "Restart":
+            self.restart_keep_settings()
+        elif item == "Settings":
+            self.in_settings = True
+            self.settings_index = 0
+        elif item == "Quit":
+            return "quit"
+        return None
+
+    def activate_gameover_item(self) -> str | None:
+        # game-over menu: 0 = Restart, 1 = Quit
+        if self.over_index == 0:
+            return "restart"
+        return "quit"
+
+    def handle_key(self, key: int, now: float) -> str | None:
+        """Returns 'quit'/'restart' signals. ESC opens the pause menu."""
+        import curses
+        e = self.engine
+        KEY_MOUSE = getattr(curses, "KEY_MOUSE", -9999)
+
+        # --- mouse clicks (menu buttons) ---
+        if key == KEY_MOUSE:
+            return self.handle_mouse()
+
+        # --- settings screen ---
+        if self.menu_open and self.in_settings:
+            if key in (27, curses.KEY_BACKSPACE if hasattr(curses, "KEY_BACKSPACE") else 127,
+                       ord("b"), ord("B")):
+                self.in_settings = False  # back to pause menu
+                return None
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.settings_index = (self.settings_index - 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.settings_index = (self.settings_index + 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_LEFT, ord("h"), ord("H")):
+                self.adjust_setting(-1)
+                return None
+            if key in (curses.KEY_RIGHT, ord("l"), ord("L")):
+                self.adjust_setting(+1)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                self.adjust_setting(+1)
+                return None
+            if key in (ord("q"), ord("Q")):
+                self.in_settings = False
+                return None
+            return None
+
+        # --- pause menu ---
+        if self.menu_open:
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.menu_index = (self.menu_index - 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.menu_index = (self.menu_index + 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return self.activate_menu_item(now)
+            if key == 27:  # ESC continues
+                self.close_menu(now)
+                return None
+            if key in (ord("p"), ord("P"), ord("c"), ord("C")):
+                self.close_menu(now)
+                return None
+            if key in (ord("r"), ord("R")):
+                self.restart_keep_settings()
+                return None
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            for i, item in enumerate(self.menu_items):
+                if key == ord(str(i + 1)):
+                    self.menu_index = i
+                    return self.activate_menu_item(now)
+            return None
+
+        # --- game over menu ---
+        if e.game_over:
+            if key in (curses.KEY_UP, curses.KEY_DOWN, ord("w"), ord("W"),
+                       ord("s"), ord("S"), 9):  # TAB also toggles
+                self.over_index = 1 - self.over_index
+                return None
+            if key in (curses.KEY_LEFT, ord("h"), ord("H")):
+                self.over_index = 0
+                return None
+            if key in (curses.KEY_RIGHT, ord("l"), ord("L")):
+                self.over_index = 1
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return self.activate_gameover_item()
+            if key in (ord("r"), ord("R")):
+                return "restart"
+            if key in (ord("q"), ord("Q"), 27):
+                return "quit"
+            return None
+
+        # --- normal gameplay ---
+        if key == 27:  # ESC pauses + opens menu (no longer quits)
+            self.open_menu(now)
+            return None
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (ord("p"), ord("P")):
+            self.open_menu(now)
+            return None
+        if key in (ord("m"), ord("M")):
+            self.show_ghost = not self.show_ghost
+            return None
+        if key in (ord("r"), ord("R")):
+            return "restart"
+        if self.paused:
+            return None
+        # One key event = exactly ONE cell. No DAS/ARR layer here: holding a
+        # key relies on the terminal's own key-repeat, so a single tap can
+        # never move 2 cells.
+        if key in (curses.KEY_LEFT, ord("h"), ord("H")):
+            e.move(-1, 0)
+        elif key in (curses.KEY_RIGHT, ord("l"), ord("L")):
+            e.move(1, 0)
+        elif key in (curses.KEY_DOWN, ord("s"), ord("S"), ord("j"), ord("J")):
+            # Soft drop = HOLD to fall faster (gravity switches to the fast
+            # interval while held). No instant step here by design: pressing
+            # Down only speeds the piece up, it never teleports it.
+            self.down_held = True
+            self._last_down_event = now
+        elif key in (curses.KEY_UP, ord("x"), ord("X"), ord("w"), ord("W")):
+            e.rotate(+1)
+        elif key in (ord("z"), ord("Z")):
+            e.rotate(-1)
+        elif key in (ord("a"), ord("A")):
+            e.rotate(2)
+        elif key == ord(" "):
+            dist = e.hard_drop()
+            if dist:
+                self.flash_rows = []
+            if e.game_over:
+                self.on_game_over()
+        elif key in (ord("c"), ord("C")):
+            e.hold()
+        return None
+
+    def handle_mouse(self) -> str | None:
+        """Activate whichever menu button was clicked. Returns quit/restart."""
+        import curses
+        now = time.monotonic()
+        try:
+            _id, mx, my, _z, _b = curses.getmouse()
+        except Exception:
+            return None
+        for (bid, by, bx, bw) in self._menu_buttons:
+            if by == my and bx <= mx < bx + bw:
+                if self.engine.game_over and not self.menu_open:
+                    if bid == "over_restart":
+                        return "restart"
+                    if bid == "over_quit":
+                        return "quit"
+                elif self.menu_open and not self.in_settings:
+                    for i, item in enumerate(self.menu_items):
+                        if bid == f"menu_{i}":
+                            self.menu_index = i
+                            return self.activate_menu_item(now)
+                elif self.menu_open and self.in_settings:
+                    if bid == "set_back":
+                        self.in_settings = False
+                        return None
+        return None
+
+    def handle_key_release_tracking(self, now: float) -> None:
+        # curses has no key-up events; poll current pressed state via
+        # getch with nodelay: we approximate "held" by remembering last
+        # movement key time — if no repeat event arrives we expire held
+        # state after a grace period. Simpler robust approach: track
+        # keys pressed within last 120ms as held.
+        pass
+
+    def toggle_pause(self, now: float) -> None:
+        if self.paused:
+            self.elapsed_pause += now - self._pause_started
+            self.paused = False
+        else:
+            self._pause_started = now
+            self.paused = True
+
+    def on_game_over(self) -> None:
+        if self.engine.score > self.highscore:
+            self.highscore = self.engine.score
+            self.new_high = True
+            save_highscore(self.engine.score)
+
+    # -- auto shift ---------------------------------------------------------
+    def apply_autoshift(self, now: float) -> None:
+        # Intentionally minimal. Left/right movement is exactly one cell per
+        # key event (terminal key-repeat handles holding), so there is no
+        # custom DAS/ARR repeat here — the old implementation double-moved on
+        # quick taps. This only expires the soft-drop "held" state.
+        HOLD_EXPIRE = 0.20
+        if self.down_held and now - self._last_down_event > HOLD_EXPIRE:
+            self.down_held = False
+
+    # -- main loop ------------------------------------------------------------
+    def run(self) -> None:
+        import curses
+        stdscr = self.stdscr
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(8)  # ~125Hz poll, low CPU with getch blocking 8ms
+        stdscr.keypad(True)
+        try:  # make ESC (menu) responsive; arrows still work via keypad
+            curses.set_escdelay(25)
+        except Exception:
+            pass
+        try:  # clickable menu buttons when the terminal supports mouse
+            _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
+                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+            curses.mousemask(_mm)
+        except Exception:
+            pass
+        self.pairs = _init_colors()
+        if self.mono:
+            self.pairs = {k: 20 for k in self.pairs}
+
+        prev = time.monotonic()
+        while True:
+            now = time.monotonic()
+            dt = min(0.1, now - prev)
+            prev = now
+
+            # --- input (drain all pending keys) ---
+            while True:
+                try:
+                    key = stdscr.getch()
+                except Exception:
+                    key = -1
+                if key == -1:
+                    break
+                sig = self.handle_key(key, now)
+                if sig == "quit":
+                    self.on_game_over()
+                    return
+                if sig == "restart":
+                    self.restart_keep_settings()
+                    prev = time.monotonic()
+                    break
+
+            down_held = (now - self._last_down_event < 0.20) and not self.paused
+            if not self.paused and not self.engine.game_over:
+                self.apply_autoshift(now)
+                cleared = self.engine.update(dt, soft_drop_held=down_held)
+                if cleared:
+                    self.flash_rows = list(cleared)
+                    self.flash_until = now + LINE_FLASH_TIME
+                if self.engine.game_over:
+                    self.on_game_over()
+            elif self.paused:
+                pass
+
+            self.render(now)
+            # cap ~60fps (getch timeout already paces the loop)
+            elapsed = time.monotonic() - now
+            if elapsed < 0.005:
+                time.sleep(0.005 - elapsed)
+
+    # -- rendering ------------------------------------------------------------
+    def render(self, now: float) -> None:
+        import curses
+        stdscr = self.stdscr
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        min_w, min_h = 72, 26
+        if maxx < min_w or maxy < min_h:
+            msg = [
+                "Terminal too small for Tetris.",
+                f"Need at least {min_w}x{min_h}, you have {maxx}x{maxy}.",
+                "Resize the terminal or press Q to quit.",
+            ]
+            for i, line in enumerate(msg):
+                try:
+                    stdscr.addstr(maxy // 2 - 1 + i, max(0, (maxx - len(line)) // 2), line,
+                                  curses.A_BOLD)
+                except Exception:
+                    pass
+            stdscr.refresh()
+            return
+
+        # Layout: board 10 cells * 2 cols = 20 wide, 20 tall + borders.
+        board_w = WIDTH * CELL_W  # 20
+        board_h = HEIGHT          # 20
+        panel_w = 24
+        total_w = panel_w + (board_w + 2) + panel_w + 4
+        ox = max(0, (maxx - total_w) // 2)
+        oy = max(1, (maxy - (board_h + 4)) // 2)
+
+        left_x = ox
+        board_x = ox + panel_w + 2
+        right_x = board_x + board_w + 2 + 2
+
+        title = " C A K E T R I S "
+        try:
+            stdscr.addstr(oy - 1 if oy >= 1 else 0, board_x - 2,
+                          "┌" + "─" * board_w + "┐")
+        except Exception:
+            pass
+
+        # Title bar
+        try:
+            stdscr.addstr(max(0, oy - 1), max(0, (maxx - len(title)) // 2), title,
+                          curses.A_BOLD | curses.color_pair(22))
+        except Exception:
+            pass
+
+        e = self.engine
+        flashing = now < self.flash_until
+        flash_set = set(self.flash_rows) if flashing else set()
+
+        # Board with side borders
+        for r in range(HEIGHT):
+            sy = oy + 1 + r
+            # borders
+            try:
+                stdscr.addstr(sy, board_x - 2, "│")
+                stdscr.addstr(sy, board_x + board_w, "│")
+            except Exception:
+                pass
+            for c in range(WIDTH):
+                sx = board_x + c * CELL_W
+                if r in flash_set and e.board[r][c] == 0:
+                    # during flash, cleared rows show white even if emptied
+                    draw_block(stdscr, sy, sx, 1, flash=True)
+                    continue
+                v = e.board[r][c]
+                if v:
+                    kind = ID_TO_PIECE.get(v, "I")
+                    draw_block(stdscr, sy, sx, self.pairs.get(kind, 1),
+                               flash=(r in flash_set))
+                else:
+                    try:
+                        ch = "· " if (r + c) % 2 == 0 else " ."
+                        stdscr.addstr(sy, sx, ch, curses.color_pair(20) | curses.A_DIM)
+                    except Exception:
+                        pass
+
+        # bottom border
+        try:
+            stdscr.addstr(oy + 1 + board_h, board_x - 2, "└" + "─" * board_w + "┘")
+        except Exception:
+            pass
+
+        # current + ghost pieces on top of board
+        if e.current and not e.game_over:
+            gy = e.ghost_y() if self.show_ghost else None
+            if self.show_ghost and gy is not None and gy != e.current.y:
+                for (cx, cy) in e.current.cells(y=gy):
+                    if 0 <= cy < HEIGHT and 0 <= cx < WIDTH:
+                        draw_block(stdscr, oy + 1 + cy, board_x + cx * CELL_W,
+                                   self.pairs.get(e.current.kind, 1), ghost=True)
+            for (cx, cy) in e.current.cells():
+                if 0 <= cy < HEIGHT and 0 <= cx < WIDTH:
+                    draw_block(stdscr, oy + 1 + cy, board_x + cx * CELL_W,
+                               self.pairs.get(e.current.kind, 1))
+
+        # ---- left panel: hold, stats ----
+        lx = left_x
+        ly = oy
+        self.text_box(lx, ly, panel_w, 7, "HOLD  (C)")
+        draw_mini_piece(stdscr, ly + 2, lx + 8, e.hold_kind, self.pairs)
+
+        self.text_box(lx, ly + 8, panel_w, 13, "STATS")
+        lines = [
+            f"Score  {e.score:>12,}",
+            f"Best   {max(self.highscore, e.score):>12,}",
+            f"Lines  {e.lines:>12}",
+            f"Level  {e.level:>12}",
+            f"Combo  {(('x' + str(e.combo + 1)) if e.combo > 0 else ('-' if e.combo < 0 else 'x1')):>12}",
+            f"B2B    {'ON ' if e.b2b else ' -- ':>12}",
+            f"Pieces {e.pieces:>12}",
+        ]
+        for i, s in enumerate(lines):
+            self.put(lx + 2, ly + 10 + i, s[: panel_w - 3])
+        # level progress bar
+        prog = (e.lines % 10) / 10.0
+        bar_len = panel_w - 8
+        filled = int(prog * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        self.put(lx + 2, ly + 18, f"Next {bar[:bar_len]}")
+        self.put(lx + 2, ly + 19, f"Grav {gravity_for_level(e.level):.2f}s/row")
+
+        # ---- right panel: next, controls ----
+        rx = right_x
+        ry = oy
+        vn = self.visible_next
+        self.text_box(rx, ry, panel_w, 4 + vn * 3, f"NEXT ({vn})")
+        for i, kind in enumerate(e.next_queue[:vn]):
+            base = ry + 2 + i * 3
+            self.put(rx + 2, base - 1, f"{i + 1}." if i > 0 else "▶")
+            draw_mini_piece(stdscr, base - 1, rx + 6, kind, self.pairs)
+
+        cy = ry + 4 + vn * 3 + 1
+        ch = maxy - cy - 1
+        self.text_box(rx, cy, panel_w, ch, "HELP")
+        help_lines = [
+            "←→/H L move (1 cell)", "↓/S/J hold: fast fall", "↑/X/W rotate",
+            "Z ccw  A 180°", "SPACE hard drop", "C hold  M ghost",
+            "ESC/P menu  R restart", "Q quit",
+        ]
+        for i, s in enumerate(help_lines):
+            if cy + 2 + i < maxy - 1:
+                self.put(rx + 2, cy + 2 + i, s)
+
+        # footer status line
+        status = self.status_line(now)
+        try:
+            stdscr.addstr(maxy - 1, max(0, (maxx - len(status)) // 2), status[: maxx - 1],
+                          curses.A_DIM)
+        except Exception:
+            pass
+
+        # overlays
+        if self.menu_open:
+            if self.in_settings:
+                self.draw_settings_menu()
+            else:
+                self.draw_pause_menu()
+        elif e.game_over:
+            self.draw_gameover_menu()
+
+        stdscr.refresh()
+
+    def status_line(self, now: float) -> str:
+        e = self.engine
+        if e.game_over:
+            return "Game over — ←→ choose · Enter restart · Q quit"
+        if self.menu_open:
+            return "Menu — ↑↓ choose · Enter select · ESC continue"
+        elapsed = now - self.start_time - self.elapsed_pause - (
+            (now - self._pause_started) if self.paused else 0.0)
+        mm = int(elapsed // 60)
+        ss = int(elapsed % 60)
+        return (f"Lv {e.level} · {e.score:,} pts · {e.lines} lines · "
+                f"{mm:02d}:{ss:02d} · SPACE hard drop · ESC menu")
+
+    def put(self, x: int, y: int, text: str, attr: int = 0) -> None:
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except Exception:
+            pass
+
+    def text_box(self, x: int, y: int, w: int, h: int, title: str = "") -> None:
+        import curses
+        if h <= 0:
+            return
+        try:
+            self.stdscr.addstr(y, x, "┌" + "─" * (w - 2) + "┐", curses.A_DIM)
+            for i in range(1, h - 1):
+                self.stdscr.addstr(y + i, x, "│", curses.A_DIM)
+                self.stdscr.addstr(y + i, x + w - 1, "│", curses.A_DIM)
+            self.stdscr.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.A_DIM)
+            if title:
+                self.stdscr.addstr(y, x + 2, f" {title} ", curses.A_BOLD)
+        except Exception:
+            pass
+
+    def overlay(self, lines: list[str]) -> None:
+        import curses
+        maxy, maxx = self.stdscr.getmaxyx()
+        w = max(len(s) for s in lines) + 8
+        h = len(lines) + 4
+        x0 = max(0, (maxx - w) // 2)
+        y0 = max(0, (maxy - h) // 2)
+        try:
+            for yy in range(y0, min(maxy, y0 + h)):
+                self.stdscr.addstr(yy, x0, " " * min(w, maxx - x0),
+                                   curses.color_pair(21) | curses.A_BOLD)
+            for i, s in enumerate(lines):
+                self.stdscr.addstr(y0 + 2 + i, x0 + (w - len(s)) // 2, s,
+                                   curses.color_pair(21) | curses.A_BOLD)
+        except Exception:
+            pass
+
+    # -- pause / settings / game-over menus (keyboard + mouse) -------------
+    def _mattr(self, kind: str) -> int:
+        """Menu color attribute. Falls back gracefully in mono/no-color."""
+        import curses
+        if self.mono:
+            if kind in ("sel", "title"):
+                return curses.A_REVERSE | curses.A_BOLD
+            return curses.A_BOLD
+        try:
+            if kind == "bg":
+                return curses.color_pair(30)
+            if kind == "title":
+                return curses.color_pair(31) | curses.A_BOLD
+            if kind == "sel":
+                return curses.color_pair(32) | curses.A_BOLD
+            if kind == "hint":
+                return curses.color_pair(33) | curses.A_DIM
+            if kind == "border":
+                return curses.color_pair(34) | curses.A_BOLD
+            if kind == "text":
+                return curses.color_pair(30) | curses.A_BOLD
+            if kind == "value":
+                return curses.color_pair(31) | curses.A_BOLD
+        except Exception:
+            pass
+        import curses as _c
+        return _c.A_BOLD
+
+    def menu_button(self, y: int, x: int, label: str, selected: bool,
+                    bid: str) -> int:
+        """Draw a button, remember its rect for mouse clicks. Returns width."""
+        text = f"[ {label} ]"
+        if selected:
+            text = f"[▶ {label} ]"
+        w = len(text)
+        try:
+            if selected:
+                self.stdscr.addstr(y, x, text, self._mattr("sel"))
+            else:
+                self.stdscr.addstr(y, x, text, self._mattr("text"))
+        except Exception:
+            pass
+        self._menu_buttons.append((bid, y, x, w))
+        return w
+
+    def menu_panel(self, title: str, inner_h: int, inner_w: int
+                   ) -> tuple[int, int]:
+        maxy, maxx = self.stdscr.getmaxyx()
+        w = inner_w + 6
+        h = inner_h + 4
+        x0 = max(0, (maxx - w) // 2)
+        y0 = max(0, (maxy - h) // 2)
+        try:
+            for yy in range(y0, min(maxy, y0 + h)):
+                self.stdscr.addstr(yy, x0, " " * min(w, maxx - x0),
+                                   self._mattr("bg"))
+            self.stdscr.addstr(y0, x0, "┌" + "─" * (w - 2) + "┐",
+                               self._mattr("border"))
+            self.stdscr.addstr(y0 + h - 1, x0, "└" + "─" * (w - 2) + "┘",
+                               self._mattr("border"))
+            self.stdscr.addstr(y0 + 1, x0 + (w - len(title)) // 2, title,
+                               self._mattr("title"))
+        except Exception:
+            pass
+        return x0, y0
+
+    def draw_pause_menu(self) -> None:
+        self._menu_buttons = []
+        e = self.engine
+        inner_w = 34
+        x0, y0 = self.menu_panel(f"Ⅱ PAUSED — Lv {e.level} · {e.score:,} pts",
+                                 len(self.menu_items) + 3, inner_w)
+        try:
+            for i, item in enumerate(self.menu_items):
+                by = y0 + 3 + i
+                bx = x0 + (inner_w + 6 - (len(item) + 6)) // 2
+                self.menu_button(by, bx, f"{i + 1}. {item}",
+                                 i == self.menu_index, f"menu_{i}")
+            hint = "↑↓ navigate · Enter select · ESC continue"
+            self.stdscr.addstr(y0 + 3 + len(self.menu_items) + 1,
+                               x0 + (inner_w + 6 - len(hint)) // 2, hint,
+                               self._mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_settings_menu(self) -> None:
+        import curses
+        rows = self.settings_rows()
+        inner_w = 38
+        x0, y0 = self.menu_panel("⚙ SETTINGS", len(rows) + 3, inner_w)
+        hint = "↑↓ row · ←→ change · ESC back"
+        hy, hx = y0 + 3 + len(rows) + 1, x0 + (inner_w + 6 - len(hint)) // 2
+        self._menu_buttons = [("set_back", hy, hx, len(hint))]
+        try:
+            for i, (name, val) in enumerate(rows):
+                by = y0 + 3 + i
+                marker = "▶" if i == self.settings_index else " "
+                line = f"{marker} {name}"
+                self.stdscr.addstr(by, x0 + 3, line[:22].ljust(22),
+                                   self._mattr("sel") if i == self.settings_index
+                                   else self._mattr("text"))
+                vtext = f"< {val} >"
+                self.stdscr.addstr(by, x0 + 3 + 23, vtext,
+                                   self._mattr("value"))
+            self.stdscr.addstr(hy, hx, hint, self._mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_gameover_menu(self) -> None:
+        import curses
+        e = self.engine
+        hs = max(self.highscore, e.score)
+        title = "GAME OVER" + ("  ★ NEW BEST!" if self.new_high else "")
+        stats = [f"Score  {e.score:,}", f"Lines  {e.lines}   Level {e.level}",
+                 f"Best   {hs:,}"]
+        inner_w = 36
+        x0, y0 = self.menu_panel(title, len(stats) + 4, inner_w)
+        # layout first so mouse hit-rects exist even if drawing is clipped
+        by = y0 + 3 + len(stats) + 1
+        b0 = "[▶ Restart ]" if self.over_index == 0 else "[ Restart ]"
+        b1 = "[▶ Quit ]" if self.over_index == 1 else "[ Quit ]"
+        gap = 4
+        total = len(b0) + gap + len(b1)
+        bx = x0 + (inner_w + 6 - total) // 2
+        self._menu_buttons = [("over_restart", by, bx, len(b0)),
+                              ("over_quit", by, bx + len(b0) + gap, len(b1))]
+        try:
+            for i, s in enumerate(stats):
+                self.stdscr.addstr(y0 + 3 + i, x0 + (inner_w + 6 - len(s)) // 2, s,
+                                   self._mattr("value"))
+            if self.over_index == 0:
+                self.stdscr.addstr(by, bx, b0, self._mattr("sel"))
+            else:
+                self.stdscr.addstr(by, bx, b0, self._mattr("text"))
+            if self.over_index == 1:
+                self.stdscr.addstr(by, bx + len(b0) + gap, b1,
+                                   self._mattr("sel"))
+            else:
+                self.stdscr.addstr(by, bx + len(b0) + gap, b1,
+                                   self._mattr("text"))
+            hint = "←→ choose · Enter select · R restart"
+            self.stdscr.addstr(by + 2, x0 + (inner_w + 6 - len(hint)) // 2, hint,
+                               self._mattr("hint"))
+        except Exception:
+            pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Caketris — polished terminal Tetris (Linux)")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed for piece order")
+    parser.add_argument("--no-ghost", action="store_true", help="hide ghost piece by default")
+    parser.add_argument("--mono", action="store_true", help="disable colors")
+    parser.add_argument("--test", action="store_true", help="run headless logic self-test and exit")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_selftest()
+
+    # Windows fallback message (msvcrt/curses may be missing)
+    if os.name == "nt":
+        try:
+            import curses  # noqa
+        except Exception:
+            print("This game needs curses. On Windows install windows-curses first:\n"
+                  "  pip install windows-curses\n  python caketris",
+                  file=sys.stderr)
+            return 2
+    else:
+        try:
+            import curses  # noqa
+        except Exception as exc:
+            print(f"curses is required: {exc}", file=sys.stderr)
+            return 2
+
+    import curses
+
+    def _wrapped(stdscr):
+        app = CursesApp(stdscr, args)
+        app.run()
+
+    try:
+        curses.wrapper(_wrapped)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Headless self-test (also used for verification)
+# --------------------------------------------------------------------------
+
+def run_selftest() -> int:
+    fails = []
+
+    def check(name: str, cond: bool, detail: str = ""):
+        print(("PASS " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    # 1. shapes: every rotation has 4 cells
+    check("shapes-4-cells", all(len(r) == 4 for v in SHAPES.values() for r in v))
+    # 2. bag randomizer yields all 7 in first 7 dealt (current + queue)
+    e = TetrisEngine(seed=1)
+    first7 = [e.current.kind] + e.next_queue[:6]
+    check("7-bag", sorted(first7) == sorted(SHAPES.keys()), str(first7))
+    # 3. movement + collision at walls
+    e2 = TetrisEngine(seed=0)
+    e2.current = Piece("O", 0, -1, 0)
+    check("wall-collide", e2.collides(e2.current, x=-2))
+    check("move-left-blocked", e2.move(-1, 0) is False)
+    # 4. rotation works
+    e3 = TetrisEngine(seed=0)
+    e3.board = [[0] * WIDTH for _ in range(HEIGHT)]
+    e3.current = Piece("T", 0, 3, 0)
+    check("rotate-cw", e3.rotate(+1) and e3.current.rot == 1)
+    check("rotate-ccw", e3.rotate(-1) and e3.current.rot == 0)
+    check("rotate-180", e3.rotate(2) and e3.current.rot == 2)
+    # 5. line clear scoring
+    e4 = TetrisEngine(seed=0)
+    e4.board[-1] = [1] * WIDTH
+    e4.board[-2] = [1] * WIDTH
+    e4.current = Piece("O", 0, 4, 0)
+    n_before = e4.lines
+    e4.lock_piece()
+    check("line-clear", e4.lines >= n_before + 1, f"lines={e4.lines}")
+    check("score-positive", e4.score > 0, f"score={e4.score}")
+    # 6. ghost reaches bottom/stack
+    e5 = TetrisEngine(seed=0)
+    e5.current = Piece("I", 0, 3, 0)
+    gy = e5.ghost_y()
+    check("ghost-below", gy >= e5.current.y, f"gy={gy}")
+    # 7. hard drop locks + spawns next
+    e6 = TetrisEngine(seed=42)
+    pieces_before = e6.pieces
+    e6.hard_drop()
+    check("hard-drop-locks", e6.pieces == pieces_before + 1)
+    # 8. hold swaps
+    e7 = TetrisEngine(seed=7)
+    first = e7.current.kind
+    e7.hold()
+    check("hold-stores", e7.hold_kind == first)
+    check("hold-locks-once", e7.hold() is False)
+    # 9. gravity decreases with level
+    check("gravity-curve", gravity_for_level(10) < gravity_for_level(1))
+    # 10. update() gravity moves piece down over time
+    e8 = TetrisEngine(seed=3)
+    e8.current = Piece("O", 0, 4, 0)
+    y0 = e8.current.y
+    for _ in range(200):
+        e8.update(0.05)
+        if e8.current.y != y0 or e8.pieces > 0:
+            break
+    check("gravity-falls", e8.current.y > y0 or e8.pieces > 0)
+    # 11. full-board game-over path doesn't crash
+    e9 = TetrisEngine(seed=0)
+    e9.board = [[1] * WIDTH for _ in range(HEIGHT)]
+    try:
+        e9.spawn_piece("T")
+        check("game-over-detected", e9.game_over)
+    except Exception as exc:
+        check("game-over-detected", False, str(exc))
+    # 12. regulation board dimensions: 10 wide x 20 tall, board array matches
+    check("board-10x20", WIDTH == 10 and HEIGHT == 20, f"{WIDTH}x{HEIGHT}")
+    eb = TetrisEngine(seed=0)
+    check("board-array-shape",
+          len(eb.board) == HEIGHT and all(len(row) == WIDTH for row in eb.board))
+    # 13. every piece spawns fully inside the 10-wide board (all rotations fit)
+    spawn_ok = True
+    for kind in SHAPES:
+        for rot in range(4):
+            p = Piece(kind, rot, SPAWN_X[kind], SPAWN_Y)
+            for (cx, cy) in p.cells():
+                if cx < 0 or cx >= WIDTH:
+                    spawn_ok = False
+    check("spawn-fits-10-wide", spawn_ok)
+    # 14. every rotation of every piece stays 4 cells inside board height span
+    shape_ok = all(
+        len(SHAPES[k][r]) == 4 and max(c[0] for c in SHAPES[k][r]) < WIDTH
+        for k in SHAPES for r in range(4))
+    check("shapes-fit-board", shape_ok)
+
+    total = 14
+    print(f"\n{total - len(fails)}/{total} checks passed.")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
