@@ -90,7 +90,7 @@ Settings: ghost piece, colors, **piece skin** (Solid/Outline/Letters/Dots),
 
 | Key | Action |
 |-----|--------|
-| Arrows / WASD / HJKL | steer (turns are buffered — steer early) |
+| Arrows / WASD / HJKL | ONE cell per press (hold to keep walking) |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
 | `R` / `Q` | quick restart / quit |
 | `M` | toggle colors |

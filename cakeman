@@ -6,7 +6,7 @@ Cakeman — a Pac-Man-style maze chase for the Linux terminal.
   cakeman --help     # options
 
 Controls:
-  ←→↑↓ / WASD / HJKL   steer (buffered — turn early, it remembers)
+  ←→↑↓ / WASD / HJKL   move ONE cell per press (hold to keep walking)
   ESC / P              pause menu (Continue · Restart · Settings · Quit)
   R                    quick restart
   Q                    quit
@@ -43,9 +43,9 @@ MAZE = [
     "#.##.#.#####.#.##.#",
     "#.##.#.#####.#.##.#",
     "#....#...#...#....#",
-    "#####.##---##.#####",
+    "#....##.---.##....#",
     "       #GGG#       ",
-    "#####.##---##.#####",
+    "#....##.---.##....#",
     "#....#...#...#....#",
     "#.##.#.#####.#.##.#",
     "#.##.#.#####.#.##.#",
@@ -230,7 +230,6 @@ class PacEngine:
                 "corner": SCATTER_CORNERS[i],
                 "acc": 0.0,
             })
-        self.player_acc = 0.0
         self.fright_timer = 0.0
         self.ghost_chain = 0
         self.mode = "scatter"
@@ -240,6 +239,8 @@ class PacEngine:
         self.ready_timer = max(self.ready_timer, 0.0)
 
     def player_interval(self) -> float:
+        # Reference only: steps are key-driven now, so the effective pace
+        # while holding comes from the terminal's key-repeat rate.
         return max(BASE_PLAYER * self.speed_mult - 0.004 * (self.level - 1), 0.055)
 
     def ghost_interval(self, state: str) -> float:
@@ -284,13 +285,8 @@ class PacEngine:
                 for g in self.ghosts:
                     if g["state"] == "fright":
                         g["state"] = "active"
-        # move player + ghosts
-        self.player_acc += dt
-        while self.player_acc >= self.player_interval():
-            self.player_acc -= self.player_interval()
-            self._step_player()
-            if self.game_over:
-                return
+        # player does NOT auto-move: one key press = one step (holding the
+        # key relies on terminal key-repeat). Ghosts keep their own ticks.
         for g in self.ghosts:
             g["acc"] += dt
             iv = self.ghost_interval(g["state"] if g["state"] != "leaving" else "active")
@@ -305,20 +301,24 @@ class PacEngine:
 
     # -- player ---------------------------------------------------------------
     def steer(self, d: str) -> None:
-        if d in DIRS:
-            self.player["buf"] = d
+        self.nudge(d)
 
-    def _step_player(self) -> None:
+    def nudge(self, d: str) -> bool:
+        """One step in direction d. Returns True if the player moved.
+
+        A single key press moves exactly one cell (or turns to face an
+        open cell). Holding the key streams repeats from the terminal,
+        which keeps walking until the key is released or a wall stops it.
+        """
+        if d not in DIRS or self.game_over or self.ready_timer > 0:
+            return False
         p = self.player
-        # try buffered turn first
-        bx, by = DIRS[p["buf"]]
-        nx, ny = (p["pos"][0] + bx) % MW, p["pos"][1] + by
-        if self.walkable(nx, ny):
-            p["dir"] = p["buf"]
-        dx, dy = DIRS[p["dir"]]
+        dx, dy = DIRS[d]
         nx, ny = (p["pos"][0] + dx) % MW, p["pos"][1] + dy
         if not self.walkable(nx, ny):
-            return  # wall: wait
+            return False
+        p["dir"] = d
+        p["buf"] = d
         p["pos"] = (nx, ny)
         if (nx, ny) in self.pellets:
             self.pellets.discard((nx, ny))
@@ -327,8 +327,12 @@ class PacEngine:
             self.powers.discard((nx, ny))
             self.score += 50
             self.start_fright()
+        self._collisions()
+        if self.game_over:
+            return True
         if not self.pellets and not self.powers:
             self._level_clear()
+        return True
 
     def start_fright(self) -> None:
         self.fright_timer = fright_time(self.level)
@@ -939,7 +943,7 @@ class CursesApp:
         ry = oy
         self.text_box(rx, ry, panel_w, 12, "HELP")
         for i, s in enumerate([
-                "Arrows/WASD move", "turns are buffered", "eat all crumbs!",
+                "Arrows/WASD: 1 step", "hold key = keep going", "eat all crumbs!",
                 f"{sk['power']} = hunt ghosts", "ghosts pay 200→1600",
                 "ESC menu  R restart", "Q quit  M colors",
         ]):
@@ -1141,23 +1145,19 @@ def run_selftest() -> int:
     check("crumbs-exist", len(e.pellets) > 150 and len(e.powers) == 4,
           f"{len(e.pellets)} pellets, {len(e.powers)} powers")
     check("house-door", all(MAZE[y][x] == "-" for (x, y) in DOOR))
-    # 3. walls block movement
+    # 3. one press = one step; walls block
     e.player["pos"] = (1, 1)
-    e.player["dir"] = e.player["buf"] = "left"
-    e._step_player()
-    check("wall-blocks", e.player["pos"] == (1, 1))
+    check("wall-blocks", e.nudge("left") is False and e.player["pos"] == (1, 1))
+    check("one-press-one-step", e.nudge("right") is True and e.player["pos"] == (2, 1))
     # 4. eating a pellet scores
-    e.player["pos"] = (1, 1)
-    e.player["dir"] = e.player["buf"] = "right"
     s0 = e.score
-    e._step_player()  # (2,1) has a pellet
-    check("pellet-scores", e.score == s0 + 10 and (2, 1) not in e.pellets)
+    e.nudge("right")  # (3,1) has a pellet
+    check("pellet-scores", e.score == s0 + 10 and (3, 1) not in e.pellets)
     # 5. power treat -> fright
     e2 = PacEngine(seed=2)
     e2.ready_timer = 0
     e2.player["pos"] = (1, 2)
-    e2.player["dir"] = e2.player["buf"] = "down"  # (1,3) is a power treat
-    e2._step_player()
+    e2.nudge("down")  # (1,3) is a power treat
     check("power-fright", e2.fright_timer > 0 and
           all(g["state"] in ("fright", "house", "leaving") for g in e2.ghosts),
           f"fright={e2.fright_timer}")
@@ -1180,8 +1180,7 @@ def run_selftest() -> int:
     e5 = PacEngine(seed=5)
     e5.ready_timer = 0
     e5.player["pos"] = (0, 10)
-    e5.player["dir"] = e5.player["buf"] = "left"
-    e5._step_player()
+    e5.nudge("left")
     check("tunnel-wraps", e5.player["pos"] == (MW - 1, 10), str(e5.player["pos"]))
     # 9. clearing crumbs -> next level
     e6 = PacEngine(seed=6)
@@ -1190,9 +1189,8 @@ def run_selftest() -> int:
     e6.powers.clear()
     e6.powers.add((9, 15))
     e6.player["pos"] = (8, 15)
-    e6.player["dir"] = e6.player["buf"] = "right"
     lv = e6.level
-    e6._step_player()
+    e6.nudge("right")
     check("level-clear", e6.level == lv + 1 and len(e6.pellets) > 100)
     # 10. ghost personalities target different tiles
     e7 = PacEngine(seed=7)
@@ -1215,7 +1213,31 @@ def run_selftest() -> int:
     ok = all(set(t) == {"maze", "player", "ghosts", "pellet"} and len(t["ghosts"]) == 4
              for t in THEMES.values())
     check("themes-valid", ok)
-    # 12. update() runs without errors for a while
+    # 12. whole maze connected: every crumb reachable from player start,
+    # ghosts can get out of the house to the player area
+    e9 = PacEngine(seed=9)
+    seen = {PLAYER_START}
+    stack = [PLAYER_START]
+    while stack:
+        cx, cy = stack.pop()
+        for dx, dy in DIRS.values():
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < MW and 0 <= ny < MH):
+                continue  # stay on-board (tunnel wrap tested separately)
+            if (nx, ny) not in seen and e9.walkable(nx, ny):
+                seen.add((nx, ny))
+                stack.append((nx, ny))
+    unreached = [c for c in list(e9.pellets) + list(e9.powers) if c not in seen]
+    check("maze-connected", not unreached, f"{len(unreached)} crumbs cut off")
+    check("house-escapes", EYE_REVIVE in seen, "no path out of the ghost house")
+    # 13. holding a key walks until a wall (simulated repeats stop at walls)
+    e10 = PacEngine(seed=10)
+    e10.ready_timer = 0
+    e10.player["pos"] = (1, 5)  # open row
+    steps = sum(1 for _ in range(30) if e10.nudge("right"))
+    check("hold-walks-to-wall", e10.player["pos"] == (17, 5) and steps == 16,
+          f"pos={e10.player['pos']} steps={steps}")
+    # 14. update() runs without errors for a while (ghosts roam on their own)
     e8 = PacEngine(seed=8)
     e8.ready_timer = 0
     try:
@@ -1227,7 +1249,7 @@ def run_selftest() -> int:
     except Exception as exc:
         check("soak-no-crash", False, str(exc))
 
-    total = 12
+    total = 20
     print(f"\n{total - len(fails)}/{total} checks passed.")
     return 1 if fails else 0
 
