@@ -6,7 +6,8 @@ Cakeman — a Pac-Man-style maze chase for the Linux terminal.
   cakeman --help     # options
 
 Controls:
-  ←→↑↓ / WASD / HJKL   move ONE cell per press (hold to keep walking)
+  ←→↑↓ / WASD / HJKL   Step mode: ONE cell per press (hold to walk)
+                       Auto mode: classic slide until a wall (see Settings)
   ESC / P              pause menu (Continue · Restart · Settings · Quit)
   R                    quick restart
   Q                    quit
@@ -104,6 +105,10 @@ THEME_NAMES = list(THEMES.keys())
 SPEEDS = {"Chill": 1.35, "Normal": 1.0, "Turbo": 0.72}
 SPEED_NAMES = list(SPEEDS.keys())
 
+# Movement styles: Step = one press moves one cell (hold to keep walking);
+# Auto = classic slide — keeps walking until a wall (turns are remembered).
+CONTROLS = ["Step", "Auto"]
+
 BASE_PLAYER = 0.105
 BASE_GHOST = 0.128
 BASE_FRIGHT = 0.175
@@ -134,7 +139,7 @@ def save_highscore(score: int) -> None:
 
 def load_settings() -> dict:
     defaults = {"skin": "Cake", "theme": "Classic", "speed": "Normal",
-                "mono": False}
+                "controls": "Step", "mono": False}
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -147,16 +152,19 @@ def load_settings() -> dict:
             defaults["theme"] = "Classic"
         if defaults["speed"] not in SPEEDS:
             defaults["speed"] = "Normal"
+        if defaults["controls"] not in CONTROLS:
+            defaults["controls"] = "Step"
     except Exception:
         pass
     return defaults
 
 
-def save_settings(skin: str, theme: str, speed: str, mono: bool) -> None:
+def save_settings(skin: str, theme: str, speed: str, controls: str,
+                  mono: bool) -> None:
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump({"skin": skin, "theme": theme, "speed": speed,
-                       "mono": mono}, f)
+                       "controls": controls, "mono": mono}, f)
     except Exception:
         pass
 
@@ -174,9 +182,11 @@ def _manhattan(a, b) -> int:
 
 
 class PacEngine:
-    def __init__(self, seed: int | None = None, speed: str = "Normal"):
+    def __init__(self, seed: int | None = None, speed: str = "Normal",
+                 controls: str = "Step"):
         self.rng = random.Random(seed)
         self.speed_mult = SPEEDS.get(speed, 1.0)
+        self.auto = controls == "Auto"  # classic slide vs one-step-per-press
         self.score = 0
         self.lives = 3
         self.level = 1
@@ -230,6 +240,7 @@ class PacEngine:
                 "corner": SCATTER_CORNERS[i],
                 "acc": 0.0,
             })
+        self.player_acc = 0.0
         self.fright_timer = 0.0
         self.ghost_chain = 0
         self.mode = "scatter"
@@ -285,8 +296,17 @@ class PacEngine:
                 for g in self.ghosts:
                     if g["state"] == "fright":
                         g["state"] = "active"
-        # player does NOT auto-move: one key press = one step (holding the
-        # key relies on terminal key-repeat). Ghosts keep their own ticks.
+        # player does NOT auto-move in Step mode: one key press = one step
+        # (holding the key relies on terminal key-repeat). In Auto mode the
+        # player keeps sliding until a wall (classic behavior).
+        # Ghosts keep their own ticks either way.
+        if self.auto:
+            self.player_acc += dt
+            while self.player_acc >= self.player_interval():
+                self.player_acc -= self.player_interval()
+                self._auto_step()
+                if self.game_over:
+                    return
         for g in self.ghosts:
             g["acc"] += dt
             iv = self.ghost_interval(g["state"] if g["state"] != "leaving" else "active")
@@ -306,9 +326,9 @@ class PacEngine:
     def nudge(self, d: str) -> bool:
         """One step in direction d. Returns True if the player moved.
 
-        A single key press moves exactly one cell (or turns to face an
-        open cell). Holding the key streams repeats from the terminal,
-        which keeps walking until the key is released or a wall stops it.
+        Works in both modes: in Step mode this IS the movement (one press,
+        one cell; holding streams repeats from the terminal). In Auto mode
+        it turns/steps immediately and the slide continues from there.
         """
         if d not in DIRS or self.game_over or self.ready_timer > 0:
             return False
@@ -320,6 +340,24 @@ class PacEngine:
         p["dir"] = d
         p["buf"] = d
         p["pos"] = (nx, ny)
+        self._arrive(nx, ny)
+        return True
+
+    def _auto_step(self) -> None:
+        """Classic slide: try the buffered turn, else keep walking."""
+        p = self.player
+        bx, by = DIRS[p["buf"]]
+        nx, ny = (p["pos"][0] + bx) % MW, p["pos"][1] + by
+        if self.walkable(nx, ny):
+            p["dir"] = p["buf"]
+        dx, dy = DIRS[p["dir"]]
+        nx, ny = (p["pos"][0] + dx) % MW, p["pos"][1] + dy
+        if not self.walkable(nx, ny):
+            return  # wall: wait here until a new direction is pressed
+        p["pos"] = (nx, ny)
+        self._arrive(nx, ny)
+
+    def _arrive(self, nx: int, ny: int) -> None:
         if (nx, ny) in self.pellets:
             self.pellets.discard((nx, ny))
             self.score += 10
@@ -328,11 +366,8 @@ class PacEngine:
             self.score += 50
             self.start_fright()
         self._collisions()
-        if self.game_over:
-            return True
-        if not self.pellets and not self.powers:
+        if not self.game_over and not self.pellets and not self.powers:
             self._level_clear()
-        return True
 
     def start_fright(self) -> None:
         self.fright_timer = fright_time(self.level)
@@ -505,8 +540,10 @@ class CursesApp:
         self.speed_name = cfg["speed"] if not args.speed else args.speed
         if self.speed_name not in SPEEDS:
             self.speed_name = "Normal"
+        self.controls_name = cfg["controls"]
         self.mono = cfg["mono"] or args.mono
-        self.engine = PacEngine(seed=args.seed, speed=self.speed_name)
+        self.engine = PacEngine(seed=args.seed, speed=self.speed_name,
+                                controls=self.controls_name)
         self.highscore = load_highscore()
         self.new_high = False
         self.paused = False
@@ -531,6 +568,7 @@ class CursesApp:
             ("Character skin", self.skin_name),
             ("Theme", self.theme_name),
             ("Speed", self.speed_name),
+            ("Controls", self.controls_name),
             ("Colors", "OFF (mono)" if self.mono else "ON"),
             ("Reset best score", "press →"),
         ]
@@ -552,8 +590,12 @@ class CursesApp:
             self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
             self.engine.speed_mult = SPEEDS[self.speed_name]
         elif i == 3 and direction != 0:
-            self.mono = not self.mono
+            cur = CONTROLS.index(self.controls_name)
+            self.controls_name = CONTROLS[(cur + direction) % len(CONTROLS)]
+            self.engine.auto = self.controls_name == "Auto"
         elif i == 4 and direction != 0:
+            self.mono = not self.mono
+        elif i == 5 and direction != 0:
             self.highscore = 0
             try:
                 if os.path.exists(HIGHSCORE_PATH):
@@ -564,7 +606,7 @@ class CursesApp:
 
     def persist_settings(self) -> None:
         save_settings(self.skin_name, self.theme_name, self.speed_name,
-                      self.mono)
+                      self.controls_name, self.mono)
 
     # -- menu state -----------------------------------------------------------
     def open_menu(self, now: float) -> None:
@@ -593,13 +635,15 @@ class CursesApp:
 
     def restart(self) -> None:
         args, stdscr = self.args, self.stdscr
-        skin, theme, speed, mono = (self.skin_name, self.theme_name,
-                                    self.speed_name, self.mono)
+        skin, theme, speed, controls, mono = (
+            self.skin_name, self.theme_name, self.speed_name,
+            self.controls_name, self.mono)
         highscore = self.highscore
         self.__init__(stdscr, args)
         (self.skin_name, self.theme_name, self.speed_name,
-         self.mono) = (skin, theme, speed, mono)
+         self.controls_name, self.mono) = (skin, theme, speed, controls, mono)
         self.engine.speed_mult = SPEEDS[speed]
+        self.engine.auto = controls == "Auto"
         self.highscore = highscore
         _init_colors(theme)
 
@@ -942,8 +986,10 @@ class CursesApp:
         # right panel: help
         ry = oy
         self.text_box(rx, ry, panel_w, 12, "HELP")
+        move_hint = ("Arrows: auto-walk" if self.engine.auto
+                     else "Arrows: 1 step")
         for i, s in enumerate([
-                "Arrows/WASD: 1 step", "hold key = keep going", "eat all crumbs!",
+                move_hint, "hold key = keep going", "eat all crumbs!",
                 f"{sk['power']} = hunt ghosts", "ghosts pay 200→1600",
                 "ESC menu  R restart", "Q quit  M colors",
         ]):
@@ -1007,6 +1053,11 @@ class CursesApp:
         w, h = inner_w + 6, inner_h + 4
         x0, y0 = max(0, (maxx - w) // 2), max(0, (maxy - h) // 2)
         try:
+            # solid fill first: wipe the maze behind the menu so text is
+            # always readable (same non-transparent look as caketris)
+            for yy in range(y0 + 1, min(maxy, y0 + h - 1)):
+                self.stdscr.addstr(yy, x0 + 1, " " * (w - 2),
+                                   self.mattr("text"))
             self.stdscr.addstr(y0, x0, "┌" + "─" * (w - 2) + "┐", self.mattr("text"))
             for yy in range(y0 + 1, y0 + h - 1):
                 self.stdscr.addstr(yy, x0, "│", self.mattr("text"))
@@ -1237,7 +1288,29 @@ def run_selftest() -> int:
     steps = sum(1 for _ in range(30) if e10.nudge("right"))
     check("hold-walks-to-wall", e10.player["pos"] == (17, 5) and steps == 16,
           f"pos={e10.player['pos']} steps={steps}")
-    # 14. update() runs without errors for a while (ghosts roam on their own)
+    # 14. controls default to Step; Auto slides on its own
+    check("controls-default-step", PacEngine(seed=1).auto is False)
+    ea = PacEngine(seed=11, controls="Auto")
+    ea.ready_timer = 0
+    ea.player["pos"] = (1, 5)
+    ea.player["dir"] = ea.player["buf"] = "right"
+    for _ in range(40):
+        ea.update(0.05)
+    check("auto-slides", ea.player["pos"][0] > 5, str(ea.player["pos"]))
+    es = PacEngine(seed=11, controls="Step")
+    es.ready_timer = 0
+    es.player["pos"] = (1, 5)
+    es.player["dir"] = es.player["buf"] = "right"
+    for _ in range(40):
+        es.update(0.05)
+    check("step-stays-put", es.player["pos"] == (1, 5), str(es.player["pos"]))
+    # 15. nudge steers instantly in Auto mode too
+    ea2 = PacEngine(seed=12, controls="Auto")
+    ea2.ready_timer = 0
+    ea2.player["pos"] = (9, 15)
+    check("auto-nudge-turns", ea2.nudge("left") is True and
+          ea2.player["dir"] == "left", str(ea2.player["pos"]))
+    # 16. update() runs without errors for a while (ghosts roam on their own)
     e8 = PacEngine(seed=8)
     e8.ready_timer = 0
     try:
@@ -1249,7 +1322,7 @@ def run_selftest() -> int:
     except Exception as exc:
         check("soak-no-crash", False, str(exc))
 
-    total = 20
+    total = 24
     print(f"\n{total - len(fails)}/{total} checks passed.")
     return 1 if fails else 0
 

@@ -90,7 +90,7 @@ Settings: ghost piece, colors, **piece skin** (Solid/Outline/Letters/Dots),
 
 | Key | Action |
 |-----|--------|
-| Arrows / WASD / HJKL | ONE cell per press (hold to keep walking) |
+| Arrows / WASD / HJKL | Step: ONE cell per press · Auto: classic slide |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
 | `R` / `Q` | quick restart / quit |
 | `M` | toggle colors |
@@ -100,7 +100,8 @@ hunt them for 200 → 400 → 800 → 1600. Three lives per run, endless levels.
 
 Settings: **character skin** (Cake/Arcade/Retro/Letters — changes you, the
 four ghosts, crumbs and walls), **theme** (Classic/Candy/Midnight/Forest),
-speed (Chill/Normal/Turbo), reset best.
+speed (Chill/Normal/Turbo), **controls** (Step = one press per cell,
+Auto = classic slide-until-wall), reset best.
 
 ## Requirements
 
