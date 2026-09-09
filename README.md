@@ -110,8 +110,8 @@ Auto = classic slide-until-wall), reset best.
 
 | Key | Action |
 |-----|--------|
-| `↑` / `W` / `K` | move paddle up (hold) |
-| `↓` / `S` / `J` | move paddle down (hold) |
+| `↑` / `W` / `K` | paddle up — one cell per press (hold to run) |
+| `↓` / `S` / `J` | paddle down — one cell per press (hold to run) |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
 | `R` / `Q` | quick restart / quit |
 | `M` | toggle colors |
