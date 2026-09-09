@@ -1,10 +1,10 @@
-# 🍰 Cake Arcade
+# 👽 Alien Arcade
 
 Two polished games for the Linux terminal. Single files, zero dependencies —
 just Python 3 + `curses` (preinstalled on virtually every Linux distro).
 
-- **🍰 Caketris** — polished Tetris: 7-bag, ghost, hold, levels, combo scoring
-- **👻 Cakeman** — Pac-Man-style maze chase with 4 ghost personalities
+- **👽 Alientris** — polished Tetris: 7-bag, ghost, hold, levels, combo scoring
+- **👻 Alien-Man** — Pac-Man-style maze chase with 4 ghost personalities
 
 ![requires a terminal ≥ 72×26 with color support]
 
@@ -13,20 +13,20 @@ just Python 3 + `curses` (preinstalled on virtually every Linux distro).
 **One-line install with curl** (recommended — installs all three commands):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zouxtr/cake-game/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zouxtr/alien-games/main/install.sh | bash
 ```
 
 Then run the picker:
 
 ```bash
-cake-game
+alien-games
 ```
 
 or launch a game directly:
 
 ```bash
-caketris    # tetris
-cakeman     # pacman clone
+alientris    # tetris
+alien-man     # pacman clone
 ```
 
 > If your shell says `command not found`, `~/.local/bin` is not on your
@@ -40,8 +40,8 @@ cakeman     # pacman clone
 
 ```bash
 mkdir -p ~/.local/bin
-for g in caketris cakeman cake-game; do
-  curl -fsSL "https://raw.githubusercontent.com/zouxtr/cake-game/main/$g" \
+for g in alientris alien-man alien-games; do
+  curl -fsSL "https://raw.githubusercontent.com/zouxtr/alien-games/main/$g" \
     -o ~/.local/bin/$g
   chmod +x ~/.local/bin/$g
 done
@@ -50,27 +50,27 @@ done
 **Clone the repo:**
 
 ```bash
-git clone https://github.com/zouxtr/cake-game.git
-cd cake-game
-./cake-game    # or ./caketris / ./cakeman
+git clone https://github.com/zouxtr/alien-games.git
+cd alien-games
+./alien-games    # or ./alientris / ./alien-man
 ```
 
 ## Remove the games
 
 ```bash
-rm ~/.local/bin/caketris ~/.local/bin/cakeman ~/.local/bin/cake-game
+rm ~/.local/bin/alientris ~/.local/bin/alien-man ~/.local/bin/alien-games
 ```
 
 Optionally delete saved best scores and settings:
 
 ```bash
-rm -f ~/.caketris_highscore.json ~/.caketris_settings.json \
-      ~/.cakeman_highscore.json ~/.cakeman_settings.json
+rm -f ~/.alientris_highscore.json ~/.alientris_settings.json \
+      ~/.alien-man_highscore.json ~/.alien-man_settings.json
 ```
 
 That's everything — the games keep no other files on your system.
 
-## Caketris controls
+## Alientris controls
 
 | Key | Action |
 |-----|--------|
@@ -86,7 +86,7 @@ That's everything — the games keep no other files on your system.
 Settings: ghost piece, colors, **piece skin** (Solid/Outline/Letters/Dots),
 **theme** (Classic/Candy/Ocean/Sunset), next-preview count, reset best.
 
-## Cakeman controls
+## Alien-Man controls
 
 | Key | Action |
 |-----|--------|
@@ -98,7 +98,7 @@ Settings: ghost piece, colors, **piece skin** (Solid/Outline/Letters/Dots),
 Eat every crumb to clear the maze. Power treats send the ghosts running —
 hunt them for 200 → 400 → 800 → 1600. Three lives per run, endless levels.
 
-Settings: **character skin** (Cake/Arcade/Retro/Letters — changes you, the
+Settings: **character skin** (Alien/Arcade/Retro/Letters — changes you, the
 four ghosts, crumbs and walls), **theme** (Classic/Candy/Midnight/Forest),
 speed (Chill/Normal/Turbo), **controls** (Step = one press per cell,
 Auto = classic slide-until-wall), reset best.

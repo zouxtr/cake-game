@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Caketris — a polished Tetris for the Linux terminal.
+Alientris — a polished Tetris for the Linux terminal.
 
-  caketris            # play
-  caketris --help     # options
+  alientris            # play
+  alientris --help     # options
 
 Controls (default):
   ← / →  or  H / L   move (exactly one cell per press)
@@ -72,8 +72,24 @@ _GRAVITY_CACHE: dict[int, float] = {1: 0.8, 2: 0.72, 3: 0.63, 4: 0.55,
 
 LINE_SCORES = {0: 0, 1: 100, 2: 300, 3: 500, 4: 800}
 
-HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".caketris_highscore.json")
-SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".caketris_settings.json")
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".alientris_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".alientris_settings.json")
+# Previous names — scores/settings carry over automatically on first run.
+LEGACY_HIGHSCORES = [os.path.join(os.path.expanduser("~"), p) for p in
+                     (".caketris_highscore.json", ".tetris_terminal_highscore.json")]
+LEGACY_SETTINGS = [os.path.join(os.path.expanduser("~"), ".caketris_settings.json")]
+
+
+def _load_json(paths: list[str]) -> dict | None:
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return None
 
 # Piece skins (how blocks look) and color themes (board palette).
 TETRIS_SKINS = ["Solid", "Outline", "Letters", "Dots"]
@@ -94,19 +110,18 @@ THEME_COLORS: dict[str, dict[str, str]] = {
 def load_settings() -> dict:
     defaults = {"ghost": True, "mono": False, "next": VISIBLE_NEXT,
                 "skin": "Solid", "theme": "Classic"}
+    data = _load_json([SETTINGS_PATH] + LEGACY_SETTINGS) or {}
+    for k, v in defaults.items():
+        if k in data:
+            defaults[k] = data[k]
+    if defaults["skin"] not in TETRIS_SKINS:
+        defaults["skin"] = "Solid"
+    if defaults["theme"] not in TETRIS_THEMES:
+        defaults["theme"] = "Classic"
     try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k, v in defaults.items():
-            if k in data:
-                defaults[k] = data[k]
-        if defaults["skin"] not in TETRIS_SKINS:
-            defaults["skin"] = "Solid"
-        if defaults["theme"] not in TETRIS_THEMES:
-            defaults["theme"] = "Classic"
         defaults["next"] = min(5, max(1, int(defaults.get("next", 5))))
     except Exception:
-        pass
+        defaults["next"] = VISIBLE_NEXT
     return defaults
 
 
@@ -476,10 +491,9 @@ class TetrisEngine:
 # --------------------------------------------------------------------------
 
 def load_highscore() -> int:
+    data = _load_json([HIGHSCORE_PATH] + LEGACY_HIGHSCORES) or {}
     try:
-        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return int(data.get("highscore", 0))
+        return int(data.get("highscore", 0))
     except Exception:
         return 0
 
@@ -1033,7 +1047,7 @@ class CursesApp:
         board_x = ox + panel_w + 2
         right_x = board_x + board_w + 2 + 2
 
-        title = " C A K E T R I S "
+        title = " A L I E N T R I S "
         try:
             stdscr.addstr(oy - 1 if oy >= 1 else 0, board_x - 2,
                           "┌" + "─" * board_w + "┐")
@@ -1349,7 +1363,7 @@ class CursesApp:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Caketris — polished terminal Tetris (Linux)")
+    parser = argparse.ArgumentParser(description="Alientris — polished terminal Tetris (Linux)")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for piece order")
     parser.add_argument("--no-ghost", action="store_true", help="hide ghost piece by default")
     parser.add_argument("--mono", action="store_true", help="disable colors")
@@ -1365,7 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
             import curses  # noqa
         except Exception:
             print("This game needs curses. On Windows install windows-curses first:\n"
-                  "  pip install windows-curses\n  python caketris",
+                  "  pip install windows-curses\n  python alientris",
                   file=sys.stderr)
             return 2
     else:

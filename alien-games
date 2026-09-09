@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Cake arcade picker — choose your game, then play.
+"""Alien arcade picker — choose your game, then play.
 
-  cake-game    # shows the picker
+  alien-games    # shows the picker
 """
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ import shutil
 import sys
 
 GAMES = [
-    ("caketris", "🍰 Caketris",
+    ("alientris", "👽 Alientris",
      "Polished terminal Tetris — stack, spin & clear lines.",
      "Arrows move · Space hard drop · ESC menu"),
-    ("cakeman", "👻 Cakeman",
+    ("alien-man", "👻 Alien-Man",
      "Pac-Man-style maze chase — eat every crumb, dodge the ghosts.",
      "Arrows/WASD steer · power treats = revenge · ESC menu"),
 ]
@@ -48,7 +48,7 @@ def pick(stdscr) -> str | None:
     def draw() -> None:
         stdscr.erase()
         maxy, maxx = stdscr.getmaxyx()
-        title = "★  CAKE ARCADE  ★"
+        title = "★  ALIEN ARCADE  ★"
         try:
             stdscr.addstr(2, max(0, (maxx - len(title)) // 2), title,
                           curses.A_BOLD | curses.A_REVERSE)

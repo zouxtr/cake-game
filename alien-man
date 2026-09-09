@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Cakeman — a Pac-Man-style maze chase for the Linux terminal.
+Alien-Man — a Pac-Man-style maze chase for the Linux terminal.
 
-  cakeman            # play
-  cakeman --help     # options
+  alien-man            # play
+  alien-man --help     # options
 
 Controls:
   ←→↑↓ / WASD / HJKL   Step mode: ONE cell per press (hold to walk)
@@ -65,13 +65,31 @@ PLAYER_START = (9, 15)
 SCATTER_CORNERS = [(17, 1), (1, 1), (17, 19), (1, 19)]
 GHOST_NAMES = ["Blinky", "Pinky", "Inky", "Clyde"]
 
-HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".cakeman_highscore.json")
-SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".cakeman_settings.json")
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".alien-man_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".alien-man_settings.json")
+# Previous names — scores/settings carry over automatically on first run.
+LEGACY_HIGHSCORES = [os.path.join(os.path.expanduser("~"), ".cakeman_highscore.json")]
+LEGACY_SETTINGS = [os.path.join(os.path.expanduser("~"), ".cakeman_settings.json")]
+
+
+def _load_json(paths: list[str]) -> dict | None:
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # skin was renamed Cake -> Alien; accept the old value
+                if data.get("skin") == "Cake":
+                    data["skin"] = "Alien"
+                return data
+        except Exception:
+            continue
+    return None
 
 # Skins: every on-screen character is skinnable. Ghosts always differ from
 # the player and (except Retro) from each other.
 SKINS: dict[str, dict] = {
-    "Cake": {"player": ("C", "c"), "ghosts": ["G", "H", "O", "S"],
+    "Alien": {"player": ("A", "a"), "ghosts": ["G", "H", "O", "S"],
              "fright": "?", "eyes": ":", "pellet": ".", "power": "o",
              "wall": "#"},
     "Arcade": {"player": ("@", "a"), "ghosts": ["R", "P", "C", "O"],
@@ -120,9 +138,9 @@ def fright_time(level: int) -> float:
 
 
 def load_highscore() -> int:
+    data = _load_json([HIGHSCORE_PATH] + LEGACY_HIGHSCORES) or {}
     try:
-        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
-            return int(json.load(f).get("highscore", 0))
+        return int(data.get("highscore", 0))
     except Exception:
         return 0
 
@@ -138,24 +156,20 @@ def save_highscore(score: int) -> None:
 
 
 def load_settings() -> dict:
-    defaults = {"skin": "Cake", "theme": "Classic", "speed": "Normal",
+    defaults = {"skin": "Alien", "theme": "Classic", "speed": "Normal",
                 "controls": "Step", "mono": False}
-    try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k in defaults:
-            if k in data:
-                defaults[k] = data[k]
-        if defaults["skin"] not in SKINS:
-            defaults["skin"] = "Cake"
-        if defaults["theme"] not in THEMES:
-            defaults["theme"] = "Classic"
-        if defaults["speed"] not in SPEEDS:
-            defaults["speed"] = "Normal"
-        if defaults["controls"] not in CONTROLS:
-            defaults["controls"] = "Step"
-    except Exception:
-        pass
+    data = _load_json([SETTINGS_PATH] + LEGACY_SETTINGS) or {}
+    for k in defaults:
+        if k in data:
+            defaults[k] = data[k]
+    if defaults["skin"] not in SKINS:
+        defaults["skin"] = "Alien"
+    if defaults["theme"] not in THEMES:
+        defaults["theme"] = "Classic"
+    if defaults["speed"] not in SPEEDS:
+        defaults["speed"] = "Normal"
+    if defaults["controls"] not in CONTROLS:
+        defaults["controls"] = "Step"
     return defaults
 
 
@@ -894,7 +908,7 @@ class CursesApp:
         min_w, min_h = 64, MH + 6
         if maxx < min_w or maxy < min_h:
             for i, line in enumerate([
-                    "Terminal too small for Cakeman.",
+                    "Terminal too small for Alien-Man.",
                     f"Need at least {min_w}x{min_h}, you have {maxx}x{maxy}.",
                     "Resize or press Q to quit."]):
                 try:
@@ -914,7 +928,7 @@ class CursesApp:
         lx, mx, rx = ox, ox + panel_w + 3, ox + panel_w + 3 + MW + 3
 
         try:
-            stdscr.addstr(max(0, oy - 1), max(0, (maxx - 13) // 2), " C A K E M A N ",
+            stdscr.addstr(max(0, oy - 1), max(0, (maxx - 13) // 2), " A L I E N M A N ",
                           curses.A_BOLD | self.pair("player"))
         except Exception:
             pass
@@ -967,7 +981,7 @@ class CursesApp:
                 pass
 
         # left panel: score
-        self.text_box(lx, oy, panel_w, 11, "CAKEMAN")
+        self.text_box(lx, oy, panel_w, 11, "ALIEN-MAN")
         for i, s in enumerate([
                 f"Score  {e.score:>9,}",
                 f"Best   {max(self.highscore, e.score):>9,}",
@@ -1033,7 +1047,7 @@ class CursesApp:
         except Exception:
             pass
 
-    # -- menus (same white/reverse look as caketris) ------------------------------
+    # -- menus (same white/reverse look as alientris) ------------------------------
     def menu_button(self, y: int, x: int, label: str, selected: bool,
                     bid: str) -> int:
         text = f"[ {label} ]"
@@ -1054,7 +1068,7 @@ class CursesApp:
         x0, y0 = max(0, (maxx - w) // 2), max(0, (maxy - h) // 2)
         try:
             # solid fill first: wipe the maze behind the menu so text is
-            # always readable (same non-transparent look as caketris)
+            # always readable (same non-transparent look as alientris)
             for yy in range(y0 + 1, min(maxy, y0 + h - 1)):
                 self.stdscr.addstr(yy, x0 + 1, " " * (w - 2),
                                    self.mattr("text"))
@@ -1140,7 +1154,7 @@ class CursesApp:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Cakeman — Pac-Man-style terminal chase")
+    parser = argparse.ArgumentParser(description="Alien-Man — Pac-Man-style terminal chase")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed")
     parser.add_argument("--speed", choices=SPEED_NAMES, default=None,
                         help="game speed (overrides saved setting)")
