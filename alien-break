@@ -38,6 +38,9 @@ PADDLE_Y = FIELD_H - 2
 BRICK_COLS, BRICK_ROWS = 12, 5
 BRICK_TOP = 2
 BASE_BALL = 15.0
+GLIDE_SPEED = 24.0  # paddle cells/sec while a direction is held
+HOLD_DAS = 0.12     # hold this long before smooth gliding kicks in
+HOLD_EXPIRE = 0.15  # no repeat event for this long = key released
 HIT_BOOST = 1.02
 MAX_BALL_MULT = 2.4
 MIN_VY_FRACTION = 0.30  # ball never goes (near-)horizontal
@@ -207,10 +210,19 @@ class BreakEngine:
         """Move the paddle exactly one cell (one key press = one cell)."""
         if self.game_over:
             return
-        self.paddle_x = min(max(self.paddle_x + direction, 0.0),
+        self._shift(direction * 1.0)
+
+    def glide(self, dt: float, direction: int) -> None:
+        """Smooth held-key motion: constant velocity, framerate-independent."""
+        if self.game_over:
+            return
+        self._shift(direction * GLIDE_SPEED * self.speed_mult * dt)
+
+    def _shift(self, dx: float) -> None:
+        self.paddle_x = min(max(self.paddle_x + dx, 0.0),
                             FIELD_W - PADDLE_W)
         if self.stuck:
-            self.ball["x"] = min(max(self.ball["x"] + direction,
+            self.ball["x"] = min(max(self.ball["x"] + dx,
                                      0.5), FIELD_W - 0.5)
 
     def update(self, dt: float) -> None:
@@ -390,6 +402,12 @@ class CursesApp:
         self.settings_index = 0
         self.over_index = 0
         self._menu_buttons: list[tuple[str, int, int, int]] = []
+        # hold-tracking: press = 1 cell instantly, hold past HOLD_DAS glides.
+        self._left_press = 0.0
+        self._left_last = -99.0
+        self._right_press = 0.0
+        self._right_last = -99.0
+        self._last_pdir = 0
         self.elapsed = 0.0
         self._pause_started = 0.0
         self.elapsed_pause = 0.0
@@ -574,14 +592,42 @@ class CursesApp:
             return None
         if self.paused:
             return None
-        # exactly ONE cell per key event; holding streams terminal repeats
+        # First press = exactly ONE cell. Later repeats only refresh the
+        # timestamp (never move, never restart the grace window).
         if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
-            e.nudge_paddle(-1)
+            if not now - self._left_last < HOLD_EXPIRE:
+                e.nudge_paddle(-1)
+                self._left_press = now
+            self._left_last = now
+            self._last_pdir = -1
         elif key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
-            e.nudge_paddle(+1)
+            if not now - self._right_last < HOLD_EXPIRE:
+                e.nudge_paddle(+1)
+                self._right_press = now
+            self._right_last = now
+            self._last_pdir = +1
         elif key == ord(" "):
             e.launch()
         return None
+
+    def apply_hold(self, now: float, dt: float) -> None:
+        """Smooth motion while a direction is held. Terminal repeats only
+        refresh timestamps, so motion is constant and stutter-free."""
+        if self.paused or self.engine.game_over or self.menu_open:
+            return
+        left = now - self._left_last < HOLD_EXPIRE
+        right = now - self._right_last < HOLD_EXPIRE
+        if left and right:
+            active = self._last_pdir  # most recent key wins
+        elif left:
+            active = -1
+        elif right:
+            active = +1
+        else:
+            return
+        pressed = self._left_press if active < 0 else self._right_press
+        if now - pressed >= HOLD_DAS:
+            self.engine.glide(dt, active)
 
     def activate_menu_item(self, now: float) -> str | None:
         item = self.menu_items[self.menu_index]
@@ -658,6 +704,7 @@ class CursesApp:
                     prev = time.monotonic()
                     break
             if not self.paused and not self.engine.game_over:
+                self.apply_hold(now, dt)
                 self.engine.update(dt)
                 if self.engine.game_over:
                     self.on_game_over()
@@ -1070,7 +1117,19 @@ def run_selftest() -> int:
             if e7.game_over:
                 break
     check("no-flat-loops", bad == 0, f"{bad} flat frames")
-    # 10. skins distinct + themes valid
+    # 10. hold glides smoothly (stuck ball follows), clamped at edges
+    e9 = BreakEngine(seed=9)
+    e9.countdown = 0
+    e9.paddle_x = 10.0
+    e9.ball["x"] = 13.0
+    e9.glide(0.5, +1)
+    check("glide-moves", abs(e9.paddle_x - (10.0 + 24.0 * 0.5)) < 1e-6 and
+          abs(e9.ball["x"] - (13.0 + 24.0 * 0.5)) < 1e-6,
+          f"{e9.paddle_x} {e9.ball['x']}")
+    e9.glide(5.0, +1)
+    check("glide-clamps", e9.paddle_x == FIELD_W - PADDLE_W and
+          e9.ball["x"] <= FIELD_W - 0.5)
+    # 11. skins distinct + themes valid
     ok = len({SKINS[n]["ball"] for n in SKINS}) == len(SKINS)
     ok = ok and len({SKINS[n]["paddle"] for n in SKINS}) == len(SKINS)
     ok = ok and len({SKINS[n]["brick"] for n in SKINS}) == len(SKINS)
@@ -1078,7 +1137,7 @@ def run_selftest() -> int:
     ok = all(set(t) == {"ball", "paddle", "brick", "wall"} for t in THEMES.values())
     check("themes-valid", ok)
 
-    total = 15
+    total = 17
     print(f"\n{total - len(fails)}/{total} checks passed.")
     return 1 if fails else 0
 
