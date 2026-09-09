@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""
+Alien-Pong — single-player Pong for the Linux terminal.
+
+  alien-pong            # play (you are the LEFT paddle)
+  alien-pong --help     # options
+
+Controls:
+  ↑ / W / K              move paddle up (hold)
+  ↓ / S / J              move paddle down (hold)
+  ESC / P                pause menu (Continue · Restart · Settings · Quit)
+  R                      quick restart
+  Q                      quit
+  M                      toggle colors
+
+First to the win score takes the match. Rallies speed the ball up —
+longest rally is remembered. Skins change the ball, paddles and net;
+themes recolor the table. Both live in Settings and persist between runs.
+Requires only the Python standard library (curses).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+FIELD_W, FIELD_H = 36, 18
+PADDLE_H = 4
+LEFT_X, RIGHT_X = 1, FIELD_W - 2
+BASE_BALL = 20.0
+BASE_PADDLE = 19.0
+HIT_BOOST = 1.04
+MAX_BALL_MULT = 2.2
+
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".alien-pong_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".alien-pong_settings.json")
+
+SKINS: dict[str, dict[str, str]] = {
+    "Alien": {"ball": "O", "paddle": "#", "net": ":"},
+    "Retro": {"ball": "*", "paddle": "|", "net": "."},
+    "Round": {"ball": "o", "paddle": "H", "net": "'"},
+    "Blocks": {"ball": "●", "paddle": "█", "net": "│"},
+}
+SKIN_NAMES = list(SKINS.keys())
+
+THEMES: dict[str, dict] = {
+    "Classic": {"ball": "WHITE", "left": "CYAN", "right": "MAGENTA",
+                "net": "WHITE"},
+    "Candy": {"ball": "YELLOW", "left": "MAGENTA", "right": "CYAN",
+              "net": "WHITE"},
+    "Midnight": {"ball": "CYAN", "left": "BLUE", "right": "WHITE",
+                 "net": "CYAN"},
+    "Forest": {"ball": "YELLOW", "left": "GREEN", "right": "WHITE",
+               "net": "GREEN"},
+}
+THEME_NAMES = list(THEMES.keys())
+
+SPEEDS = {"Chill": 0.8, "Normal": 1.0, "Turbo": 1.25}
+SPEED_NAMES = list(SPEEDS.keys())
+
+DIFFICULTY = {
+    # ai paddle speed (cells/s) + targeting error (cells)
+    "Easy": {"speed": 10.0, "error": 2.5},
+    "Normal": {"speed": 14.0, "error": 1.2},
+    "Hard": {"speed": 18.0, "error": 0.3},
+}
+DIFF_NAMES = list(DIFFICULTY.keys())
+WIN_SCORES = [5, 7, 11]
+
+
+def load_best() -> dict:
+    defaults = {"best_rally": 0, "wins": 0}
+    try:
+        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = int(data[k])
+    except Exception:
+        pass
+    return defaults
+
+
+def save_best(best_rally: int, wins: int) -> None:
+    try:
+        prev = load_best()
+        with open(HIGHSCORE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"best_rally": max(best_rally, prev.get("best_rally", 0)),
+                       "wins": max(wins, prev.get("wins", 0))}, f)
+    except Exception:
+        pass
+
+
+def load_settings() -> dict:
+    defaults = {"skin": "Alien", "theme": "Classic", "speed": "Normal",
+                "difficulty": "Normal", "win": 7, "mono": False}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+        if defaults["skin"] not in SKINS:
+            defaults["skin"] = "Alien"
+        if defaults["theme"] not in THEMES:
+            defaults["theme"] = "Classic"
+        if defaults["speed"] not in SPEEDS:
+            defaults["speed"] = "Normal"
+        if defaults["difficulty"] not in DIFFICULTY:
+            defaults["difficulty"] = "Normal"
+        if defaults["win"] not in WIN_SCORES:
+            defaults["win"] = 7
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(skin: str, theme: str, speed: str, difficulty: str,
+                  win: int, mono: bool) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"skin": skin, "theme": theme, "speed": speed,
+                       "difficulty": difficulty, "win": win, "mono": mono}, f)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Engine (no curses — fully testable headless)
+# --------------------------------------------------------------------------
+
+class PongEngine:
+    def __init__(self, seed: int | None = None, speed: str = "Normal",
+                 difficulty: str = "Normal", win_score: int = 7):
+        self.rng = random.Random(seed)
+        self.speed_mult = SPEEDS.get(speed, 1.0)
+        diff = DIFFICULTY.get(difficulty, DIFFICULTY["Normal"])
+        self.ai_speed = diff["speed"]
+        self.ai_error = diff["error"]
+        self.win_score = win_score if win_score in WIN_SCORES else 7
+        self.score_l = 0
+        self.score_r = 0
+        self.rally = 0
+        self.game_over = False
+        self.won: bool | None = None
+        self.countdown = 1.2  # "READY" before first serve
+        self.point_pause = 0.0
+        self.serve_dir = 1  # alternate serves
+        self.ball_speed = BASE_BALL * self.speed_mult
+        self.reset_point(initial=True)
+
+    def reset_point(self, initial: bool = False) -> None:
+        self.left_y = (FIELD_H - PADDLE_H) / 2
+        self.right_y = (FIELD_H - PADDLE_H) / 2
+        self.ball = {"x": FIELD_W / 2, "y": FIELD_H / 2, "vx": 0.0, "vy": 0.0}
+        self.ball_speed = BASE_BALL * self.speed_mult
+        if not initial:
+            self.point_pause = 0.9
+        self.ai_target = FIELD_H / 2
+        self.ai_error_now = 0.0
+
+    def serve(self) -> None:
+        ang = self.rng.uniform(-0.45, 0.45)
+        if self.rng.random() < 0.5:
+            ang = -ang
+        import math
+        sp = self.ball_speed
+        self.ball["vx"] = self.serve_dir * sp * math.cos(ang)
+        self.ball["vy"] = sp * math.sin(ang)
+
+    def update(self, dt: float, up_held: bool = False,
+               down_held: bool = False) -> None:
+        if self.game_over:
+            return
+        if self.countdown > 0:
+            self.countdown -= dt
+            if self.countdown <= 0:
+                self.serve()
+            return
+        if self.point_pause > 0:
+            self.point_pause -= dt
+            if self.point_pause <= 0:
+                self.serve()
+            # paddles still track during the pause
+            self._move_paddles(dt, up_held, down_held)
+            return
+        self._move_paddles(dt, up_held, down_held)
+        self._move_ball(dt)
+        if self.game_over:
+            return
+
+    # -- paddles --------------------------------------------------------------
+    def _move_paddles(self, dt: float, up_held: bool, down_held: bool) -> None:
+        step = BASE_PADDLE * self.speed_mult * dt
+        if up_held and not down_held:
+            self.left_y -= step
+        elif down_held and not up_held:
+            self.left_y += step
+        self.left_y = min(max(self.left_y, 0.0), FIELD_H - PADDLE_H)
+        # AI tracks the ball with limited speed + error
+        self.ai_error_now *= max(0.0, 1.0 - dt * 2)
+        want = self.ball["y"] - PADDLE_H / 2 + self.ai_error_now
+        if abs(want - self.right_y) > 0.15:
+            d = 1.0 if want > self.right_y else -1.0
+            self.right_y += d * min(self.ai_speed * dt, abs(want - self.right_y))
+        self.right_y = min(max(self.right_y, 0.0), FIELD_H - PADDLE_H)
+
+    # -- ball -------------------------------------------------------------------
+    def _move_ball(self, dt: float) -> None:
+        b = self.ball
+        dist = abs(b["vx"]) * dt + abs(b["vy"]) * dt
+        steps = max(1, min(8, int(dist / 0.4) + 1))
+        for _ in range(steps):
+            if self.game_over:
+                return
+            self._step_ball(dt / steps)
+
+    def _step_ball(self, dt: float) -> None:
+        b = self.ball
+        prev_x = b["x"]
+        b["x"] += b["vx"] * dt
+        b["y"] += b["vy"] * dt
+        # top / bottom walls
+        if b["y"] <= 0:
+            b["y"] = 0.0
+            b["vy"] = abs(b["vy"])
+        elif b["y"] >= FIELD_H - 1:
+            b["y"] = float(FIELD_H - 1)
+            b["vy"] = -abs(b["vy"])
+        # left paddle (you)
+        if b["vx"] < 0 and prev_x > LEFT_X + 1 >= b["x"]:
+            if self.left_y - 0.5 <= b["y"] <= self.left_y + PADDLE_H - 0.5:
+                self._bounce(1)
+        # right paddle (AI)
+        if b["vx"] > 0 and prev_x < RIGHT_X - 1 <= b["x"]:
+            if self.right_y - 0.5 <= b["y"] <= self.right_y + PADDLE_H - 0.5:
+                self._bounce(-1)
+        # scoring
+        if b["x"] < 0:
+            self._score("right")
+        elif b["x"] > FIELD_W - 1:
+            self._score("left")
+
+    def _bounce(self, direction: int) -> None:
+        b = self.ball
+        py = self.left_y if direction > 0 else self.right_y
+        offset = (b["y"] - (py + PADDLE_H / 2)) / (PADDLE_H / 2)  # -1..1
+        offset = min(max(offset, -1.0), 1.0)
+        self.ball_speed = min(self.ball_speed * HIT_BOOST,
+                              BASE_BALL * self.speed_mult * MAX_BALL_MULT)
+        import math
+        ang = offset * 1.05  # max ~60 degrees
+        b["vx"] = direction * self.ball_speed * math.cos(ang)
+        b["vy"] = self.ball_speed * math.sin(ang)
+        b["x"] = LEFT_X + 1 if direction > 0 else RIGHT_X - 1
+        self.rally += 1
+        self.ai_error_now = self.rng.uniform(-self.ai_error, self.ai_error)
+
+    def _score(self, side: str) -> None:
+        if side == "left":
+            self.score_l += 1
+        else:
+            self.score_r += 1
+        self.rally = 0
+        if self.score_l >= self.win_score:
+            self.game_over = True
+            self.won = True
+            return
+        if self.score_r >= self.win_score:
+            self.game_over = True
+            self.won = False
+            return
+        self.serve_dir = -self.serve_dir  # alternate serves
+        self.reset_point()
+
+
+# --------------------------------------------------------------------------
+# Colors
+# --------------------------------------------------------------------------
+
+def _init_colors(theme: str = "Classic") -> None:
+    import curses
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except Exception:
+        pass
+    _color = {"BLACK": curses.COLOR_BLACK, "RED": curses.COLOR_RED,
+              "GREEN": curses.COLOR_GREEN, "YELLOW": curses.COLOR_YELLOW,
+              "BLUE": curses.COLOR_BLUE, "MAGENTA": curses.COLOR_MAGENTA,
+              "CYAN": curses.COLOR_CYAN, "WHITE": curses.COLOR_WHITE}
+    pal = THEMES.get(theme, THEMES["Classic"])
+    pairs = {
+        1: (_color.get(pal["ball"], curses.COLOR_WHITE), -1),
+        2: (_color.get(pal["left"], curses.COLOR_CYAN), -1),
+        3: (_color.get(pal["right"], curses.COLOR_MAGENTA), -1),
+        4: (_color.get(pal["net"], curses.COLOR_WHITE), -1),
+        9: (curses.COLOR_BLACK, curses.COLOR_WHITE),
+        20: (curses.COLOR_WHITE, -1),
+    }
+    for pid, (fg, bg) in pairs.items():
+        try:
+            curses.init_pair(pid, fg, bg)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Curses UI
+# --------------------------------------------------------------------------
+
+class CursesApp:
+    def __init__(self, stdscr, args):
+        self.stdscr = stdscr
+        self.args = args
+        cfg = load_settings()
+        self.skin_name = cfg["skin"]
+        self.theme_name = cfg["theme"]
+        self.speed_name = cfg["speed"]
+        self.diff_name = cfg["difficulty"]
+        self.win_score = cfg["win"]
+        self.mono = cfg["mono"] or args.mono
+        self.engine = PongEngine(seed=args.seed, speed=self.speed_name,
+                                 difficulty=self.diff_name,
+                                 win_score=self.win_score)
+        best = load_best()
+        self.best_rally = best["best_rally"]
+        self.wins = best["wins"]
+        self.new_best = False
+        self.paused = False
+        self.menu_open = False
+        self.menu_index = 0
+        self.menu_items = ["Continue", "Restart", "Settings", "Quit"]
+        self.in_settings = False
+        self.settings_index = 0
+        self.over_index = 0
+        self._menu_buttons: list[tuple[str, int, int, int]] = []
+        self._last_up = 0.0
+        self._last_down = 0.0
+        self.elapsed = 0.0
+        self._pause_started = 0.0
+        self.elapsed_pause = 0.0
+
+    # -- settings -------------------------------------------------------------
+    def skin(self) -> dict[str, str]:
+        return SKINS[self.skin_name]
+
+    def settings_rows(self):
+        return [
+            ("Ball/paddle skin", self.skin_name),
+            ("Theme", self.theme_name),
+            ("Speed", self.speed_name),
+            ("AI difficulty", self.diff_name),
+            ("Win score", str(self.win_score)),
+            ("Reset records", "press →"),
+        ]
+
+    def adjust_setting(self, direction: int) -> None:
+        i = self.settings_index
+        if i == 0 and direction != 0:
+            cur = SKIN_NAMES.index(self.skin_name)
+            self.skin_name = SKIN_NAMES[(cur + direction) % len(SKIN_NAMES)]
+        elif i == 1 and direction != 0:
+            cur = THEME_NAMES.index(self.theme_name)
+            self.theme_name = THEME_NAMES[(cur + direction) % len(THEME_NAMES)]
+            try:
+                _init_colors(self.theme_name)
+            except Exception:
+                pass
+        elif i == 2 and direction != 0:
+            cur = SPEED_NAMES.index(self.speed_name)
+            self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
+            self.engine.speed_mult = SPEEDS[self.speed_name]
+        elif i == 3 and direction != 0:
+            cur = DIFF_NAMES.index(self.diff_name)
+            self.diff_name = DIFF_NAMES[(cur + direction) % len(DIFF_NAMES)]
+            diff = DIFFICULTY[self.diff_name]
+            self.engine.ai_speed = diff["speed"]
+            self.engine.ai_error = diff["error"]
+        elif i == 4 and direction != 0:
+            cur = WIN_SCORES.index(self.win_score)
+            self.win_score = WIN_SCORES[(cur + direction) % len(WIN_SCORES)]
+            self.engine.win_score = self.win_score
+        elif i == 5 and direction != 0:
+            self.best_rally = 0
+            self.wins = 0
+            try:
+                if os.path.exists(HIGHSCORE_PATH):
+                    os.remove(HIGHSCORE_PATH)
+            except Exception:
+                pass
+        self.persist_settings()
+
+    def persist_settings(self) -> None:
+        save_settings(self.skin_name, self.theme_name, self.speed_name,
+                      self.diff_name, self.win_score, self.mono)
+
+    # -- menu state -------------------------------------------------------------
+    def open_menu(self, now: float) -> None:
+        if self.engine.game_over:
+            return
+        if not self.menu_open:
+            self.menu_open = True
+            self.in_settings = False
+            self.menu_index = 0
+            if not self.paused:
+                self.toggle_pause(now)
+
+    def close_menu(self, now: float) -> None:
+        self.menu_open = False
+        self.in_settings = False
+        if self.paused:
+            self.toggle_pause(now)
+
+    def toggle_pause(self, now: float) -> None:
+        if self.paused:
+            self.elapsed_pause += now - self._pause_started
+            self.paused = False
+        else:
+            self._pause_started = now
+            self.paused = True
+
+    def restart(self) -> None:
+        args, stdscr = self.args, self.stdscr
+        saved = (self.skin_name, self.theme_name, self.speed_name,
+                 self.diff_name, self.win_score, self.mono)
+        best_rally, wins, new_best = self.best_rally, self.wins, self.new_best
+        self.__init__(stdscr, args)
+        (self.skin_name, self.theme_name, self.speed_name,
+         self.diff_name, self.win_score, self.mono) = saved
+        self.engine.speed_mult = SPEEDS[self.speed_name]
+        diff = DIFFICULTY[self.diff_name]
+        self.engine.ai_speed = diff["speed"]
+        self.engine.ai_error = diff["error"]
+        self.engine.win_score = self.win_score
+        self.best_rally, self.wins, self.new_best = best_rally, wins, new_best
+        _init_colors(self.theme_name)
+
+    def on_game_over(self) -> None:
+        e = self.engine
+        if e.rally > self.best_rally:
+            self.best_rally = e.rally
+            self.new_best = True
+        wins = self.wins + (1 if e.won else 0)
+        self.wins = wins
+        save_best(self.best_rally, wins)
+
+    # -- input --------------------------------------------------------------------
+    def handle_key(self, key: int, now: float) -> str | None:
+        import curses
+        e = self.engine
+        KEY_MOUSE = getattr(curses, "KEY_MOUSE", -9999)
+        if key == KEY_MOUSE:
+            return self.handle_mouse()
+
+        if self.menu_open and self.in_settings:
+            if key in (27, ord("b"), ord("B")):
+                self.in_settings = False
+                return None
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.settings_index = (self.settings_index - 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.settings_index = (self.settings_index + 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
+                self.adjust_setting(-1)
+                return None
+            if key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
+                self.adjust_setting(+1)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                self.adjust_setting(+1)
+                return None
+            if key in (ord("q"), ord("Q")):
+                self.in_settings = False
+                return None
+            return None
+
+        if self.menu_open:
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.menu_index = (self.menu_index - 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.menu_index = (self.menu_index + 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return self.activate_menu_item(now)
+            if key == 27:
+                self.close_menu(now)
+                return None
+            if key in (ord("p"), ord("P"), ord("c"), ord("C")):
+                self.close_menu(now)
+                return None
+            if key in (ord("r"), ord("R")):
+                self.restart()
+                return None
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            for i in range(len(self.menu_items)):
+                if key == ord(str(i + 1)):
+                    self.menu_index = i
+                    return self.activate_menu_item(now)
+            return None
+
+        if e.game_over:
+            if key in (curses.KEY_LEFT, curses.KEY_RIGHT, 9):
+                self.over_index = 1 - self.over_index
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return "restart" if self.over_index == 0 else "quit"
+            if key in (ord("r"), ord("R")):
+                return "restart"
+            if key in (ord("q"), ord("Q"), 27):
+                return "quit"
+            return None
+
+        if key == 27:
+            self.open_menu(now)
+            return None
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (ord("p"), ord("P")):
+            self.open_menu(now)
+            return None
+        if key in (ord("r"), ord("R")):
+            return "restart"
+        if key in (ord("m"), ord("M")):
+            self.mono = not self.mono
+            self.persist_settings()
+            return None
+        if self.paused:
+            return None
+        # paddle movement is hold-driven (timestamps double as held state)
+        if key in (curses.KEY_UP, ord("w"), ord("W"), ord("k"), ord("K")):
+            self._last_up = now
+        elif key in (curses.KEY_DOWN, ord("s"), ord("S"), ord("j"), ord("J")):
+            self._last_down = now
+        return None
+
+    def activate_menu_item(self, now: float) -> str | None:
+        item = self.menu_items[self.menu_index]
+        if item == "Continue":
+            self.close_menu(now)
+        elif item == "Restart":
+            self.restart()
+        elif item == "Settings":
+            self.in_settings = True
+            self.settings_index = 0
+        elif item == "Quit":
+            return "quit"
+        return None
+
+    def handle_mouse(self) -> str | None:
+        import curses
+        now = time.monotonic()
+        try:
+            _id, mx, my, _z, _b = curses.getmouse()
+        except Exception:
+            return None
+        for (bid, by, bx, bw) in self._menu_buttons:
+            if by == my and bx <= mx < bx + bw:
+                if self.engine.game_over and not self.menu_open:
+                    return "restart" if bid == "over_restart" else "quit"
+                if self.menu_open and not self.in_settings:
+                    for i in range(len(self.menu_items)):
+                        if bid == f"menu_{i}":
+                            self.menu_index = i
+                            return self.activate_menu_item(now)
+                elif self.menu_open and self.in_settings:
+                    if bid == "set_back":
+                        self.in_settings = False
+        return None
+
+    # -- main loop ------------------------------------------------------------------
+    def run(self) -> None:
+        import curses
+        stdscr = self.stdscr
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(8)
+        stdscr.keypad(True)
+        try:
+            curses.set_escdelay(25)
+        except Exception:
+            pass
+        try:
+            _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
+                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+            curses.mousemask(_mm)
+        except Exception:
+            pass
+        _init_colors(self.theme_name)
+
+        prev = time.monotonic()
+        while True:
+            now = time.monotonic()
+            dt = min(0.05, now - prev)
+            prev = now
+            while True:
+                try:
+                    key = stdscr.getch()
+                except Exception:
+                    key = -1
+                if key == -1:
+                    break
+                sig = self.handle_key(key, now)
+                if sig == "quit":
+                    self.on_game_over()
+                    return
+                if sig == "restart":
+                    self.restart()
+                    prev = time.monotonic()
+                    break
+            if not self.paused and not self.engine.game_over:
+                up = (now - self._last_up < 0.20)
+                down = (now - self._last_down < 0.20)
+                self.engine.update(dt, up_held=up, down_held=down)
+                if self.engine.game_over:
+                    self.on_game_over()
+            self.render(now)
+            elapsed = time.monotonic() - now
+            if elapsed < 0.005:
+                time.sleep(0.005 - elapsed)
+
+    # -- rendering --------------------------------------------------------------------
+    def pair(self, name: str) -> int:
+        import curses
+        table = {"ball": 1, "left": 2, "right": 3, "net": 4}
+        try:
+            if self.mono:
+                return curses.color_pair(20)
+            return curses.color_pair(table.get(name, 20))
+        except Exception:
+            return curses.A_NORMAL
+
+    def put(self, x: int, y: int, text: str, attr: int = 0) -> None:
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except Exception:
+            pass
+
+    def text_box(self, x: int, y: int, w: int, h: int, title: str = "") -> None:
+        import curses
+        if h <= 0:
+            return
+        try:
+            self.stdscr.addstr(y, x, "┌" + "─" * (w - 2) + "┐", curses.A_DIM)
+            for i in range(1, h - 1):
+                self.stdscr.addstr(y + i, x, "│", curses.A_DIM)
+                self.stdscr.addstr(y + i, x + w - 1, "│", curses.A_DIM)
+            self.stdscr.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.A_DIM)
+            if title:
+                self.stdscr.addstr(y, x + 2, f" {title} ", curses.A_BOLD)
+        except Exception:
+            pass
+
+    def mattr(self, kind: str) -> int:
+        import curses
+        if kind in ("sel", "title"):
+            return curses.A_REVERSE | curses.A_BOLD
+        if kind == "hint":
+            return curses.A_DIM
+        return curses.A_BOLD
+
+    def render(self, now: float) -> None:
+        import curses
+        stdscr = self.stdscr
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        panel_w = 16
+        total_w = panel_w + (FIELD_W + 2) + panel_w + 6
+        min_w, min_h = total_w, FIELD_H + 7
+        if maxx < min_w or maxy < min_h:
+            for i, line in enumerate([
+                    "Terminal too small for Alien-Pong.",
+                    f"Need at least {min_w}x{min_h}, you have {maxx}x{maxy}.",
+                    "Resize or press Q to quit."]):
+                try:
+                    stdscr.addstr(maxy // 2 - 1 + i, max(0, (maxx - len(line)) // 2),
+                                  line, curses.A_BOLD)
+                except Exception:
+                    pass
+            stdscr.refresh()
+            return
+
+        e = self.engine
+        sk = self.skin()
+        ox = max(0, (maxx - total_w) // 2)
+        oy = max(1, (maxy - (FIELD_H + 5)) // 2)
+        lx, fx, rx = ox, ox + panel_w + 3, ox + panel_w + 3 + FIELD_W + 2 + 3
+
+        try:
+            stdscr.addstr(max(0, oy - 1), max(0, (maxx - 15) // 2), " A L I E N - P O N G ",
+                          curses.A_BOLD | self.pair("ball"))
+        except Exception:
+            pass
+
+        # scoreboard
+        score = f"{e.score_l}   :   {e.score_r}"
+        try:
+            stdscr.addstr(oy, fx + (FIELD_W + 2 - len(score)) // 2, score,
+                          curses.A_BOLD)
+            sub = f"first to {e.win_score} · rally {e.rally}"
+            stdscr.addstr(oy + 1, fx + (FIELD_W + 2 - len(sub)) // 2, sub,
+                          curses.A_DIM)
+        except Exception:
+            pass
+
+        fy = oy + 2
+        # frame
+        try:
+            stdscr.addstr(fy, fx, "┌" + "─" * FIELD_W + "┐", curses.A_DIM)
+            for i in range(FIELD_H):
+                stdscr.addstr(fy + 1 + i, fx, "│", curses.A_DIM)
+                stdscr.addstr(fy + 1 + i, fx + FIELD_W + 1, "│", curses.A_DIM)
+            stdscr.addstr(fy + FIELD_H + 1, fx, "└" + "─" * FIELD_W + "┘",
+                          curses.A_DIM)
+        except Exception:
+            pass
+        # net
+        for i in range(0, FIELD_H, 2):
+            self.put(fx + 1 + FIELD_W // 2, fy + 1 + i, sk["net"],
+                     self.pair("net"))
+        # paddles
+        for i in range(PADDLE_H):
+            self.put(fx + 1 + LEFT_X, fy + 1 + int(e.left_y) + i,
+                     sk["paddle"], self.pair("left") | curses.A_BOLD)
+            self.put(fx + 1 + RIGHT_X, fy + 1 + int(e.right_y) + i,
+                     sk["paddle"], self.pair("right") | curses.A_BOLD)
+        # ball
+        if e.ball["vx"] != 0.0 or e.countdown <= 0:
+            self.put(fx + 1 + int(round(e.ball["x"])),
+                     fy + 1 + int(round(e.ball["y"])),
+                     sk["ball"], self.pair("ball") | curses.A_BOLD)
+
+        # left panel
+        self.text_box(lx, oy, panel_w, 9, "MATCH")
+        for i, s in enumerate([
+                f"You {e.score_l:>9}",
+                f"CPU  {e.score_r:>9}",
+                f"Rally {e.rally:>8}",
+                f"Best  {max(self.best_rally, e.rally):>8}",
+                f"Wins  {self.wins:>8}",
+        ]):
+            self.put(lx + 2, oy + 2 + i, s[: panel_w - 3])
+        self.text_box(lx, oy + 10, panel_w, 6, f"{self.skin_name.upper()}")
+        self.put(lx + 2, oy + 12, f"{sk['ball']} ball")
+        self.put(lx + 2, oy + 13, f"{sk['paddle']} paddle")
+
+        # right panel: help
+        self.text_box(rx, oy, panel_w, 10, "HELP")
+        for i, s in enumerate([
+                "↑/W up", "↓/S down", "(hold to move)", "ESC menu",
+                "R restart", "Q quit", "M colors",
+        ]):
+            self.put(rx + 2, oy + 2 + i, s[: panel_w - 3])
+
+        try:
+            status = self.status_line()
+            stdscr.addstr(maxy - 1, max(0, (maxx - len(status)) // 2),
+                          status[: maxx - 1], curses.A_DIM)
+        except Exception:
+            pass
+
+        if self.menu_open:
+            if self.in_settings:
+                self.draw_settings_menu()
+            else:
+                self.draw_pause_menu()
+        elif e.game_over:
+            self.draw_gameover_menu()
+        elif e.countdown > 0:
+            self.center_banner("READY!")
+        elif e.point_pause > 0:
+            self.center_banner("POINT!")
+
+        stdscr.refresh()
+
+    def status_line(self) -> str:
+        e = self.engine
+        if e.game_over:
+            return "Match over — ←→ choose · Enter select · Q quit"
+        if self.menu_open:
+            return "Menu — ↑↓ choose · Enter select · ESC continue"
+        return (f"{e.score_l}:{e.score_r} · rally {e.rally} · "
+                f"{self.diff_name} · ESC menu")
+
+    def center_banner(self, text: str) -> None:
+        import curses
+        maxy, maxx = self.stdscr.getmaxyx()
+        try:
+            self.stdscr.addstr(maxy // 2, (maxx - len(text)) // 2, text,
+                               curses.A_REVERSE | curses.A_BOLD)
+        except Exception:
+            pass
+
+    # -- menus (same white/reverse look as the other games) ----------------------
+    def menu_button(self, y: int, x: int, label: str, selected: bool,
+                    bid: str) -> int:
+        text = f"[ {label} ]"
+        if selected:
+            text = f"[▶ {label} ]"
+        w = len(text)
+        try:
+            self.stdscr.addstr(y, x, text, self.mattr("sel") if selected
+                               else self.mattr("text"))
+        except Exception:
+            pass
+        self._menu_buttons.append((bid, y, x, w))
+        return w
+
+    def menu_panel(self, title: str, inner_h: int, inner_w: int):
+        maxy, maxx = self.stdscr.getmaxyx()
+        w, h = inner_w + 6, inner_h + 4
+        x0, y0 = max(0, (maxx - w) // 2), max(0, (maxy - h) // 2)
+        try:
+            # solid fill: wipe the table behind the menu (non-transparent)
+            for yy in range(y0 + 1, min(maxy, y0 + h - 1)):
+                self.stdscr.addstr(yy, x0 + 1, " " * (w - 2),
+                                   self.mattr("text"))
+            self.stdscr.addstr(y0, x0, "┌" + "─" * (w - 2) + "┐",
+                               self.mattr("text"))
+            for yy in range(y0 + 1, y0 + h - 1):
+                self.stdscr.addstr(yy, x0, "│", self.mattr("text"))
+                self.stdscr.addstr(yy, x0 + w - 1, "│", self.mattr("text"))
+            self.stdscr.addstr(y0 + h - 1, x0, "└" + "─" * (w - 2) + "┘",
+                               self.mattr("text"))
+            self.stdscr.addstr(y0 + 1, x0 + (w - len(title)) // 2, title,
+                               self.mattr("title"))
+        except Exception:
+            pass
+        return x0, y0
+
+    def draw_pause_menu(self) -> None:
+        self._menu_buttons = []
+        e = self.engine
+        inner_w = 30
+        x0, y0 = self.menu_panel(f"Ⅱ PAUSED — {e.score_l}:{e.score_r}",
+                                 len(self.menu_items) + 3, inner_w)
+        try:
+            for i, item in enumerate(self.menu_items):
+                self.menu_button(y0 + 3 + i,
+                                 x0 + (inner_w + 6 - (len(item) + 6)) // 2,
+                                 f"{i + 1}. {item}", i == self.menu_index,
+                                 f"menu_{i}")
+            hint = "↑↓ navigate · Enter select · ESC continue"
+            self.stdscr.addstr(y0 + 3 + len(self.menu_items) + 1,
+                               x0 + (inner_w + 6 - len(hint)) // 2, hint,
+                               self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_settings_menu(self) -> None:
+        rows = self.settings_rows()
+        inner_w = 36
+        x0, y0 = self.menu_panel("⚙ SETTINGS", len(rows) + 3, inner_w)
+        hint = "↑↓ row · ←→ change · ESC back"
+        hy, hx = y0 + 3 + len(rows) + 1, x0 + (inner_w + 6 - len(hint)) // 2
+        self._menu_buttons = [("set_back", hy, hx, len(hint))]
+        try:
+            for i, (name, val) in enumerate(rows):
+                by = y0 + 3 + i
+                marker = "▶" if i == self.settings_index else " "
+                self.stdscr.addstr(by, x0 + 3, f"{marker} {name}"[:22].ljust(22),
+                                   self.mattr("sel") if i == self.settings_index
+                                   else self.mattr("text"))
+                self.stdscr.addstr(by, x0 + 3 + 23, f"< {val} >",
+                                   self.mattr("title"))
+            self.stdscr.addstr(hy, hx, hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_gameover_menu(self) -> None:
+        e = self.engine
+        hs = max(self.best_rally, e.rally)
+        title = ("★ YOU WIN! ★" if e.won else "CPU WINS") + (
+            "  ★ BEST RALLY!" if self.new_best else "")
+        stats = [f"Score  {e.score_l} : {e.score_r}",
+                 f"Rally  {e.rally}   Best {hs}"]
+        inner_w = 32
+        x0, y0 = self.menu_panel(title, len(stats) + 4, inner_w)
+        by = y0 + 3 + len(stats) + 1
+        b0 = "[▶ Rematch ]" if self.over_index == 0 else "[ Rematch ]"
+        b1 = "[▶ Quit ]" if self.over_index == 1 else "[ Quit ]"
+        gap = 4
+        bx = x0 + (inner_w + 6 - (len(b0) + gap + len(b1))) // 2
+        self._menu_buttons = [("over_restart", by, bx, len(b0)),
+                              ("over_quit", by, bx + len(b0) + gap, len(b1))]
+        try:
+            for i, s in enumerate(stats):
+                self.stdscr.addstr(y0 + 3 + i, x0 + (inner_w + 6 - len(s)) // 2,
+                                   s, self.mattr("title"))
+            self.stdscr.addstr(by, bx, b0, self.mattr("sel") if self.over_index == 0
+                               else self.mattr("text"))
+            self.stdscr.addstr(by, bx + len(b0) + gap, b1,
+                               self.mattr("sel") if self.over_index == 1
+                               else self.mattr("text"))
+            hint = "←→ choose · Enter select · R rematch"
+            self.stdscr.addstr(by + 2, x0 + (inner_w + 6 - len(hint)) // 2,
+                               hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Alien-Pong — terminal Pong vs CPU")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed")
+    parser.add_argument("--test", action="store_true", help="run headless self-test and exit")
+    parser.add_argument("--mono", action="store_true", help="disable colors")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_selftest()
+
+    try:
+        import curses  # noqa
+    except Exception as exc:
+        if os.name == "nt":
+            print("Install windows-curses first: pip install windows-curses",
+                  file=sys.stderr)
+            return 2
+        print(f"curses is required: {exc}", file=sys.stderr)
+        return 2
+    import curses
+
+    def _wrapped(stdscr):
+        CursesApp(stdscr, args).run()
+
+    try:
+        curses.wrapper(_wrapped)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Headless self-test
+# --------------------------------------------------------------------------
+
+def run_selftest() -> int:
+    fails = []
+
+    def check(name: str, cond: bool, detail: str = ""):
+        print(("PASS " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    # 1. field + countdown/serve
+    e = PongEngine(seed=1)
+    check("field-dims", FIELD_W == 36 and FIELD_H == 18)
+    check("countdown-serves", e.ball["vx"] == 0.0)
+    e.update(1.3)
+    check("serve-kicks", e.ball["vx"] != 0.0, str(e.ball))
+    # 2. player paddle moves + clamps
+    e2 = PongEngine(seed=2)
+    e2.countdown = 0
+    y0 = e2.left_y
+    e2.update(0.2, up_held=True)
+    check("paddle-up", e2.left_y < y0)
+    e2.left_y = 0.0
+    e2.update(0.5, up_held=True)
+    check("paddle-clamp-top", e2.left_y == 0.0)
+    e2.update(2.0, down_held=True)
+    check("paddle-clamp-bottom", e2.left_y == FIELD_H - PADDLE_H)
+    # 3. wall bounce flips vy
+    e3 = PongEngine(seed=3)
+    e3.countdown = 0
+    e3.ball = {"x": 20.0, "y": 0.2, "vx": 5.0, "vy": -8.0}
+    e3.update(0.05)
+    check("wall-bounce", e3.ball["vy"] > 0, str(e3.ball))
+    # 4. paddle bounce reflects + grows rally + speeds up
+    e4 = PongEngine(seed=4)
+    e4.countdown = 0
+    e4.left_y = 7.0
+    e4.ball = {"x": 3.0, "y": 9.0, "vx": -15.0, "vy": 0.0}
+    sp0 = e4.ball_speed
+    e4.update(0.1)
+    check("paddle-bounce", e4.ball["vx"] > 0 and e4.rally == 1, str(e4.ball))
+    check("rally-speedup", e4.ball_speed > sp0)
+    # 5. missing concedes + point pause; win ends match
+    e5 = PongEngine(seed=5, win_score=5)
+    e5.countdown = 0
+    e5.ball = {"x": 0.5, "y": 0.0, "vx": -20.0, "vy": 0.0}
+    e5.left_y = FIELD_H - PADDLE_H  # nowhere near
+    e5.update(0.2)
+    check("concede-scores", e5.score_r == 1 and e5.point_pause > 0,
+          f"{e5.score_l}:{e5.score_r}")
+    e5.score_l = 4
+    e5.ball = {"x": FIELD_W - 0.5, "y": 0.0, "vx": 20.0, "vy": 0.0}
+    e5.right_y = 0.0  # ball at top, AI paddle elsewhere... force miss
+    e5.right_y = FIELD_H - PADDLE_H
+    e5.point_pause = 0
+    e5.update(0.2)
+    check("win-ends-match", e5.game_over and e5.won is True,
+          f"{e5.score_l}:{e5.score_r}")
+    # 6. AI tracks the ball
+    e6 = PongEngine(seed=6, difficulty="Hard")
+    e6.countdown = 0
+    e6.right_y = 0.0
+    e6.ball = {"x": 30.0, "y": 16.0, "vx": 10.0, "vy": 0.0}
+    e6.update(0.5)
+    check("ai-tracks", e6.right_y > 2.0, str(e6.right_y))
+    # 7. skins distinct + themes valid
+    ok = len({SKINS[n]["ball"] for n in SKINS}) == len(SKINS)
+    ok = ok and len({SKINS[n]["paddle"] for n in SKINS}) == len(SKINS)
+    ok = ok and all(len(v) == 1 for sk in SKINS.values() for v in sk.values())
+    check("skins-distinct", ok)
+    ok = all(set(t) == {"ball", "left", "right", "net"} for t in THEMES.values())
+    check("themes-valid", ok)
+    # 8. soak: full match finishes without errors
+    try:
+        e7 = PongEngine(seed=7, difficulty="Easy", win_score=5)
+        for _ in range(20000):
+            e7.update(0.03, up_held=True, down_held=False)
+            if e7.game_over:
+                break
+        check("match-completes", e7.game_over, f"{e7.score_l}:{e7.score_r}")
+    except Exception as exc:
+        check("match-completes", False, str(exc))
+
+    total = 15
+    print(f"\n{total - len(fails)}/{total} checks passed.")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

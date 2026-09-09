@@ -15,7 +15,10 @@ GAMES = [
      "Arrows move · Space hard drop · ESC menu"),
     ("alien-man", "👻 Alien-Man",
      "Pac-Man-style maze chase — eat every crumb, dodge the ghosts.",
-     "Arrows/WASD steer · power treats = revenge · ESC menu"),
+     "Arrows/WASD step · power treats = revenge · ESC menu"),
+    ("alien-pong", "🏓 Alien-Pong",
+     "Single-player Pong — beat the CPU, first to the win score.",
+     "↑/↓ or W/S move · rallies speed up · ESC menu"),
 ]
 
 
@@ -52,7 +55,7 @@ def pick(stdscr) -> str | None:
         try:
             stdscr.addstr(2, max(0, (maxx - len(title)) // 2), title,
                           curses.A_BOLD | curses.A_REVERSE)
-            sub = "pick your game — ↑↓ + Enter (or 1/2, or click)"
+            sub = "pick your game — ↑↓ + Enter (or 1/2/3, or click)"
             stdscr.addstr(4, max(0, (maxx - len(sub)) // 2), sub, curses.A_DIM)
         except Exception:
             pass
@@ -94,7 +97,7 @@ def pick(stdscr) -> str | None:
             idx = (idx - 1) % len(GAMES)
         elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
             idx = (idx + 1) % len(GAMES)
-        elif key in (ord("1"), ord("2")):
+        elif key in (ord("1"), ord("2"), ord("3")):
             idx = key - ord("1")
             if 0 <= idx < len(GAMES):
                 return GAMES[idx][0]

@@ -26,7 +26,8 @@ or launch a game directly:
 
 ```bash
 alientris    # tetris
-alien-man     # pacman clone
+alien-man    # pacman clone
+alien-pong   # pong vs CPU
 ```
 
 > If your shell says `command not found`, `~/.local/bin` is not on your
@@ -40,7 +41,7 @@ alien-man     # pacman clone
 
 ```bash
 mkdir -p ~/.local/bin
-for g in alientris alien-man alien-games; do
+for g in alientris alien-man alien-pong alien-games; do
   curl -fsSL "https://raw.githubusercontent.com/zouxtr/alien-games/main/$g" \
     -o ~/.local/bin/$g
   chmod +x ~/.local/bin/$g
@@ -52,20 +53,22 @@ done
 ```bash
 git clone https://github.com/zouxtr/alien-games.git
 cd alien-games
-./alien-games    # or ./alientris / ./alien-man
+./alien-games    # or ./alientris / ./alien-man / ./alien-pong
 ```
 
 ## Remove the games
 
 ```bash
-rm ~/.local/bin/alientris ~/.local/bin/alien-man ~/.local/bin/alien-games
+rm ~/.local/bin/alientris ~/.local/bin/alien-man ~/.local/bin/alien-pong \
+   ~/.local/bin/alien-games
 ```
 
 Optionally delete saved best scores and settings:
 
 ```bash
 rm -f ~/.alientris_highscore.json ~/.alientris_settings.json \
-      ~/.alien-man_highscore.json ~/.alien-man_settings.json
+      ~/.alien-man_highscore.json ~/.alien-man_settings.json \
+      ~/.alien-pong_highscore.json ~/.alien-pong_settings.json
 ```
 
 That's everything — the games keep no other files on your system.
@@ -102,6 +105,23 @@ Settings: **character skin** (Alien/Arcade/Retro/Letters — changes you, the
 four ghosts, crumbs and walls), **theme** (Classic/Candy/Midnight/Forest),
 speed (Chill/Normal/Turbo), **controls** (Step = one press per cell,
 Auto = classic slide-until-wall), reset best.
+
+## Alien-Pong controls
+
+| Key | Action |
+|-----|--------|
+| `↑` / `W` / `K` | move paddle up (hold) |
+| `↓` / `S` / `J` | move paddle down (hold) |
+| `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
+| `R` / `Q` | quick restart / quit |
+| `M` | toggle colors |
+
+You are the LEFT paddle against the CPU. First to the win score takes
+the match — rallies speed the ball up, longest rally is remembered.
+
+Settings: **skin** (Alien/Retro/Round/Blocks — ball, paddles, net),
+**theme** (Classic/Candy/Midnight/Forest), speed (Chill/Normal/Turbo),
+AI difficulty (Easy/Normal/Hard), win score (5/7/11), reset records.
 
 ## Requirements
 
