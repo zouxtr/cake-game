@@ -28,6 +28,7 @@ or launch a game directly:
 alientris    # tetris
 alien-man    # pacman clone
 alien-pong   # pong vs CPU
+alien-break  # breakout
 ```
 
 > If your shell says `command not found`, `~/.local/bin` is not on your
@@ -41,7 +42,7 @@ alien-pong   # pong vs CPU
 
 ```bash
 mkdir -p ~/.local/bin
-for g in alientris alien-man alien-pong alien-games; do
+for g in alientris alien-man alien-pong alien-break alien-games; do
   curl -fsSL "https://raw.githubusercontent.com/zouxtr/alien-games/main/$g" \
     -o ~/.local/bin/$g
   chmod +x ~/.local/bin/$g
@@ -53,14 +54,14 @@ done
 ```bash
 git clone https://github.com/zouxtr/alien-games.git
 cd alien-games
-./alien-games    # or ./alientris / ./alien-man / ./alien-pong
+./alien-games    # or ./alientris / ./alien-man / ./alien-pong / ./alien-break
 ```
 
 ## Remove the games
 
 ```bash
 rm ~/.local/bin/alientris ~/.local/bin/alien-man ~/.local/bin/alien-pong \
-   ~/.local/bin/alien-games
+   ~/.local/bin/alien-break ~/.local/bin/alien-games
 ```
 
 Optionally delete saved best scores and settings:
@@ -68,7 +69,8 @@ Optionally delete saved best scores and settings:
 ```bash
 rm -f ~/.alientris_highscore.json ~/.alientris_settings.json \
       ~/.alien-man_highscore.json ~/.alien-man_settings.json \
-      ~/.alien-pong_highscore.json ~/.alien-pong_settings.json
+      ~/.alien-pong_highscore.json ~/.alien-pong_settings.json \
+      ~/.alien-break_highscore.json ~/.alien-break_settings.json
 ```
 
 That's everything — the games keep no other files on your system.
@@ -122,6 +124,23 @@ the match — rallies speed the ball up, longest rally is remembered.
 Settings: **skin** (Alien/Retro/Round/Blocks — ball, paddles, net),
 **theme** (Classic/Candy/Midnight/Forest), speed (Chill/Normal/Turbo),
 AI difficulty (Easy/Normal/Hard), win score (5/7/11), reset records.
+
+## Alien-Break controls
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` / `H` / `L` | paddle — one cell per press (hold to run) |
+| `SPACE` | launch the ball |
+| `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
+| `R` / `Q` | quick restart / quit |
+| `M` | toggle colors |
+
+Clear every brick to advance — endless levels, faster each time, top rows
+pay more. Don't let the ball past your paddle.
+
+Settings: **skin** (Alien/Retro/Round/Blocks — ball, paddle, bricks),
+**theme** (Classic/Candy/Midnight/Forest), speed (Chill/Normal/Turbo),
+lives (3/5), reset best.
 
 ## Requirements
 

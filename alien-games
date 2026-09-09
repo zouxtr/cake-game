@@ -19,6 +19,9 @@ GAMES = [
     ("alien-pong", "🏓 Alien-Pong",
      "Single-player Pong — beat the CPU, first to the win score.",
      "↑/↓ or W/S move · rallies speed up · ESC menu"),
+    ("alien-break", "🧱 Alien-Break",
+     "Breakout clone — smash every brick, don't drop the ball.",
+     "←/→ move · SPACE launch · ESC menu"),
 ]
 
 
@@ -97,10 +100,8 @@ def pick(stdscr) -> str | None:
             idx = (idx - 1) % len(GAMES)
         elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
             idx = (idx + 1) % len(GAMES)
-        elif key in (ord("1"), ord("2"), ord("3")):
-            idx = key - ord("1")
-            if 0 <= idx < len(GAMES):
-                return GAMES[idx][0]
+        elif 49 <= key <= 57 and (key - 49) < len(GAMES):
+            return GAMES[key - 49][0]
         elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
             return GAMES[idx][0]
         elif key == getattr(curses, "KEY_MOUSE", -9999):

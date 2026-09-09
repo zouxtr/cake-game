@@ -1,0 +1,1087 @@
+#!/usr/bin/env python3
+"""
+Alien-Break — a Breakout clone for the Linux terminal.
+
+  alien-break            # play
+  alien-break --help     # options
+
+Controls:
+  ← / →  or  H / L   move paddle ONE cell per press (hold to run)
+  SPACE              launch the ball / relaunch after losing one
+  ESC / P            pause menu (Continue · Restart · Settings · Quit)
+  R                  quick restart
+  Q                  quit
+  M                  toggle colors
+
+Clear every brick to advance — endless levels, faster each time.
+Bricks up top pay more. Three lives per run. Skins change the ball,
+paddle and bricks; themes recolor the wall. Both live in Settings and
+persist between runs. Requires only the Python standard library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+FIELD_W, FIELD_H = 38, 20
+PADDLE_W = 7
+PADDLE_Y = FIELD_H - 2
+BRICK_COLS, BRICK_ROWS = 12, 5
+BRICK_TOP = 2
+BASE_BALL = 15.0
+HIT_BOOST = 1.02
+MAX_BALL_MULT = 2.4
+MIN_VY_FRACTION = 0.30  # ball never goes (near-)horizontal
+
+HIGHSCORE_PATH = os.path.join(os.path.expanduser("~"), ".alien-break_highscore.json")
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".alien-break_settings.json")
+
+SKINS: dict[str, dict[str, str]] = {
+    "Alien": {"ball": "O", "paddle": "#", "brick": "X"},
+    "Retro": {"ball": "*", "paddle": "=", "brick": "+"},
+    "Round": {"ball": "o", "paddle": "H", "brick": "x"},
+    "Blocks": {"ball": "●", "paddle": "█", "brick": "▓"},
+}
+SKIN_NAMES = list(SKINS.keys())
+
+THEMES: dict[str, dict[str, str]] = {
+    "Classic": {"ball": "WHITE", "paddle": "CYAN", "brick": "MAGENTA",
+                "wall": "BLUE"},
+    "Candy": {"ball": "YELLOW", "paddle": "MAGENTA", "brick": "CYAN",
+              "wall": "MAGENTA"},
+    "Midnight": {"ball": "CYAN", "paddle": "WHITE", "brick": "BLUE",
+                 "wall": "BLUE"},
+    "Forest": {"ball": "YELLOW", "paddle": "GREEN", "brick": "GREEN",
+               "wall": "GREEN"},
+}
+THEME_NAMES = list(THEMES.keys())
+
+SPEEDS = {"Chill": 0.8, "Normal": 1.0, "Turbo": 1.25}
+SPEED_NAMES = list(SPEEDS.keys())
+LIVES_OPTIONS = [3, 5]
+
+# Brick layouts over a 12x5 grid ('#' = brick). Cycled per level.
+LAYOUTS = [
+    [
+        "############",
+        "############",
+        "############",
+        "############",
+        "############",
+    ],
+    [
+        "#.#.#.#.#.#.",
+        ".#.#.#.#.#.#",
+        "#.#.#.#.#.#.",
+        ".#.#.#.#.#.#",
+        "#.#.#.#.#.#.",
+    ],
+    [
+        ".....##.....",
+        "....####....",
+        "...######...",
+        "..########..",
+        ".##########.",
+    ],
+    [
+        "##..####..##",
+        "##..####..##",
+        "..######..##",
+        "..######....",
+        "##..####..##",
+    ],
+]
+
+
+def load_best() -> int:
+    try:
+        with open(HIGHSCORE_PATH, "r", encoding="utf-8") as f:
+            return int(json.load(f).get("best", 0))
+    except Exception:
+        return 0
+
+
+def save_best(score: int) -> None:
+    try:
+        if score <= load_best():
+            return
+        with open(HIGHSCORE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"best": int(score)}, f)
+    except Exception:
+        pass
+
+
+def load_settings() -> dict:
+    defaults = {"skin": "Alien", "theme": "Classic", "speed": "Normal",
+                "lives": 3, "mono": False}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in defaults:
+            if k in data:
+                defaults[k] = data[k]
+        if defaults["skin"] not in SKINS:
+            defaults["skin"] = "Alien"
+        if defaults["theme"] not in THEMES:
+            defaults["theme"] = "Classic"
+        if defaults["speed"] not in SPEEDS:
+            defaults["speed"] = "Normal"
+        if defaults["lives"] not in LIVES_OPTIONS:
+            defaults["lives"] = 3
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(skin: str, theme: str, speed: str, lives: int,
+                  mono: bool) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"skin": skin, "theme": theme, "speed": speed,
+                       "lives": lives, "mono": mono}, f)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Engine (no curses — fully testable headless)
+# --------------------------------------------------------------------------
+
+def brick_rect(col: int, row: int) -> tuple[float, float, float, float]:
+    """Cell-space rect (x0, y0, x1, y1) of a brick grid cell."""
+    w = FIELD_W / BRICK_COLS
+    return (col * w, BRICK_TOP + row, (col + 1) * w, BRICK_TOP + row + 1)
+
+
+class BreakEngine:
+    def __init__(self, seed: int | None = None, speed: str = "Normal",
+                 lives: int = 3):
+        self.rng = random.Random(seed)
+        self.speed_mult = SPEEDS.get(speed, 1.0)
+        self.max_lives = lives if lives in LIVES_OPTIONS else 3
+        self.score = 0
+        self.lives = self.max_lives
+        self.level = 1
+        self.game_over = False
+        self.stuck = True  # ball glued to paddle until launch
+        self.countdown = 1.0
+        self.ball_speed = BASE_BALL * self.speed_mult
+        self.reset_positions()
+        self.build_bricks()
+
+    def reset_positions(self) -> None:
+        self.paddle_x = (FIELD_W - PADDLE_W) / 2  # left edge, float
+        self.ball = {"x": FIELD_W / 2, "y": PADDLE_Y - 1.0,
+                     "vx": 0.0, "vy": 0.0}
+        self.stuck = True
+
+    def build_bricks(self) -> None:
+        layout = LAYOUTS[(self.level - 1) % len(LAYOUTS)]
+        self.bricks: set[tuple[int, int]] = set()
+        for r, line in enumerate(layout):
+            for c, ch in enumerate(line):
+                if ch == "#":
+                    self.bricks.add((c, r))
+
+    def launch(self) -> bool:
+        """Release a stuck ball. Returns True if launched."""
+        if self.game_over or not self.stuck or self.countdown > 0:
+            return False
+        import math
+        ang = self.rng.uniform(-0.5, 0.5)
+        self.ball["vx"] = self.ball_speed * math.sin(ang)
+        self.ball["vy"] = -self.ball_speed * math.cos(ang)
+        self.stuck = False
+        return True
+
+    def nudge_paddle(self, direction: int) -> None:
+        """Move the paddle exactly one cell (one key press = one cell)."""
+        if self.game_over:
+            return
+        self.paddle_x = min(max(self.paddle_x + direction, 0.0),
+                            FIELD_W - PADDLE_W)
+        if self.stuck:
+            self.ball["x"] = min(max(self.ball["x"] + direction,
+                                     0.5), FIELD_W - 0.5)
+
+    def update(self, dt: float) -> None:
+        if self.game_over:
+            return
+        if self.countdown > 0:
+            self.countdown -= dt
+            return
+        if self.stuck:
+            return
+        b = self.ball
+        dist = abs(b["vx"]) * dt + abs(b["vy"]) * dt
+        steps = max(1, min(10, int(dist / 0.4) + 1))
+        for _ in range(steps):
+            if self.game_over or self.stuck:
+                return
+            self._step_ball(dt / steps)
+
+    def _step_ball(self, dt: float) -> None:
+        b = self.ball
+        prev_x, prev_y = b["x"], b["y"]
+        b["x"] += b["vx"] * dt
+        b["y"] += b["vy"] * dt
+        # side walls
+        if b["x"] <= 0.5:
+            b["x"] = 0.5
+            b["vx"] = abs(b["vx"])
+        elif b["x"] >= FIELD_W - 0.5:
+            b["x"] = float(FIELD_W - 0.5)
+            b["vx"] = -abs(b["vx"])
+        # ceiling
+        if b["y"] <= 0.5:
+            b["y"] = 0.5
+            b["vy"] = abs(b["vy"])
+        # paddle (only when falling)
+        if b["vy"] > 0 and prev_y <= PADDLE_Y - 0.5 <= b["y"]:
+            if self.paddle_x - 0.5 <= b["x"] <= self.paddle_x + PADDLE_W - 0.5:
+                self._bounce_paddle()
+        # bricks
+        hit = self._brick_at(b["x"], b["y"])
+        if hit is not None:
+            self._break_brick(hit, prev_x, prev_y)
+        # missed entirely
+        if b["y"] >= FIELD_H:
+            self._lose_ball()
+        self._fix_angle()
+
+    def _bounce_paddle(self) -> None:
+        b = self.ball
+        offset = (b["x"] - (self.paddle_x + PADDLE_W / 2)) / (PADDLE_W / 2)
+        offset = min(max(offset, -1.0), 1.0)
+        import math
+        ang = offset * 1.05
+        b["vx"] = self.ball_speed * math.sin(ang)
+        b["vy"] = -abs(self.ball_speed * math.cos(ang))
+        b["y"] = PADDLE_Y - 0.5
+
+    def _brick_at(self, x: float, y: float) -> tuple[int, int] | None:
+        w = FIELD_W / BRICK_COLS
+        c = int(x // w)
+        r = int(y - BRICK_TOP)
+        if (c, r) in self.bricks:
+            return (c, r)
+        return None
+
+    def _break_brick(self, hit: tuple[int, int],
+                     prev_x: float, prev_y: float) -> None:
+        c, r = hit
+        self.bricks.discard(hit)
+        # points: higher rows pay more
+        self.score += (BRICK_ROWS - r) * 10
+        # bounce away along the shallow axis of entry
+        x0, y0, x1, y1 = brick_rect(c, r)
+        b = self.ball
+        if prev_x < x0 or prev_x > x1:
+            b["vx"] = -b["vx"]
+            b["x"] = x0 - 0.01 if prev_x < x0 else x1 + 0.01
+        else:
+            b["vy"] = -b["vy"]
+            b["y"] = y0 - 0.01 if prev_y < y0 else y1 + 0.01
+        self.ball_speed = min(self.ball_speed * HIT_BOOST,
+                              BASE_BALL * self.speed_mult * MAX_BALL_MULT)
+        # rescale velocity to the new speed, keeping direction
+        import math
+        ang = math.atan2(b["vx"], -b["vy"])
+        b["vx"] = self.ball_speed * math.sin(ang)
+        b["vy"] = -self.ball_speed * math.cos(ang)
+        self._fix_angle()
+        if not self.bricks:
+            self._level_clear()
+
+    def _fix_angle(self) -> None:
+        """Keep the ball from settling into (near-)horizontal loops."""
+        import math
+        b = self.ball
+        sp = math.hypot(b["vx"], b["vy"])
+        if sp <= 0:
+            return
+        min_vy = sp * MIN_VY_FRACTION
+        if abs(b["vy"]) < min_vy:
+            sign = 1.0 if b["vy"] >= 0 else -1.0
+            b["vy"] = sign * min_vy
+            b["vx"] = math.copysign(math.sqrt(max(sp * sp - b["vy"] ** 2, 0.0)),
+                                    b["vx"])
+
+    def _lose_ball(self) -> None:
+        self.lives -= 1
+        if self.lives <= 0:
+            self.game_over = True
+            return
+        self.ball_speed = BASE_BALL * self.speed_mult
+        self.reset_positions()
+
+    def _level_clear(self) -> None:
+        self.level += 1
+        self.score += 250
+        self.ball_speed = BASE_BALL * self.speed_mult * min(
+            1.0 + 0.12 * (self.level - 1), MAX_BALL_MULT)
+        self.build_bricks()
+        self.reset_positions()
+
+
+# --------------------------------------------------------------------------
+# Colors
+# --------------------------------------------------------------------------
+
+def _init_colors(theme: str = "Classic") -> None:
+    import curses
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except Exception:
+        pass
+    _color = {"BLACK": curses.COLOR_BLACK, "RED": curses.COLOR_RED,
+              "GREEN": curses.COLOR_GREEN, "YELLOW": curses.COLOR_YELLOW,
+              "BLUE": curses.COLOR_BLUE, "MAGENTA": curses.COLOR_MAGENTA,
+              "CYAN": curses.COLOR_CYAN, "WHITE": curses.COLOR_WHITE}
+    pal = THEMES.get(theme, THEMES["Classic"])
+    pairs = {
+        1: (_color.get(pal["ball"], curses.COLOR_WHITE), -1),
+        2: (_color.get(pal["paddle"], curses.COLOR_CYAN), -1),
+        3: (_color.get(pal["brick"], curses.COLOR_MAGENTA), -1),
+        4: (_color.get(pal["wall"], curses.COLOR_BLUE), -1),
+        9: (curses.COLOR_BLACK, curses.COLOR_WHITE),
+        20: (curses.COLOR_WHITE, -1),
+    }
+    for pid, (fg, bg) in pairs.items():
+        try:
+            curses.init_pair(pid, fg, bg)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Curses UI
+# --------------------------------------------------------------------------
+
+class CursesApp:
+    def __init__(self, stdscr, args):
+        self.stdscr = stdscr
+        self.args = args
+        cfg = load_settings()
+        self.skin_name = cfg["skin"]
+        self.theme_name = cfg["theme"]
+        self.speed_name = cfg["speed"]
+        self.lives_cfg = cfg["lives"]
+        self.mono = cfg["mono"] or args.mono
+        self.engine = BreakEngine(seed=args.seed, speed=self.speed_name,
+                                  lives=self.lives_cfg)
+        self.best = load_best()
+        self.new_best = False
+        self.paused = False
+        self.menu_open = False
+        self.menu_index = 0
+        self.menu_items = ["Continue", "Restart", "Settings", "Quit"]
+        self.in_settings = False
+        self.settings_index = 0
+        self.over_index = 0
+        self._menu_buttons: list[tuple[str, int, int, int]] = []
+        self.elapsed = 0.0
+        self._pause_started = 0.0
+        self.elapsed_pause = 0.0
+
+    # -- settings ---------------------------------------------------------------
+    def skin(self) -> dict[str, str]:
+        return SKINS[self.skin_name]
+
+    def settings_rows(self):
+        return [
+            ("Ball/brick skin", self.skin_name),
+            ("Theme", self.theme_name),
+            ("Speed", self.speed_name),
+            ("Lives", str(self.lives_cfg)),
+            ("Colors", "OFF (mono)" if self.mono else "ON"),
+            ("Reset best", "press →"),
+        ]
+
+    def adjust_setting(self, direction: int) -> None:
+        i = self.settings_index
+        if i == 0 and direction != 0:
+            cur = SKIN_NAMES.index(self.skin_name)
+            self.skin_name = SKIN_NAMES[(cur + direction) % len(SKIN_NAMES)]
+        elif i == 1 and direction != 0:
+            cur = THEME_NAMES.index(self.theme_name)
+            self.theme_name = THEME_NAMES[(cur + direction) % len(THEME_NAMES)]
+            try:
+                _init_colors(self.theme_name)
+            except Exception:
+                pass
+        elif i == 2 and direction != 0:
+            cur = SPEED_NAMES.index(self.speed_name)
+            self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
+            self.engine.speed_mult = SPEEDS[self.speed_name]
+        elif i == 3 and direction != 0:
+            cur = LIVES_OPTIONS.index(self.lives_cfg)
+            self.lives_cfg = LIVES_OPTIONS[(cur + direction) % len(LIVES_OPTIONS)]
+            self.engine.max_lives = self.lives_cfg
+        elif i == 4 and direction != 0:
+            self.mono = not self.mono
+        elif i == 5 and direction != 0:
+            self.best = 0
+            try:
+                if os.path.exists(HIGHSCORE_PATH):
+                    os.remove(HIGHSCORE_PATH)
+            except Exception:
+                pass
+        self.persist_settings()
+
+    def persist_settings(self) -> None:
+        save_settings(self.skin_name, self.theme_name, self.speed_name,
+                      self.lives_cfg, self.mono)
+
+    # -- menu state ---------------------------------------------------------------
+    def open_menu(self, now: float) -> None:
+        if self.engine.game_over:
+            return
+        if not self.menu_open:
+            self.menu_open = True
+            self.in_settings = False
+            self.menu_index = 0
+            if not self.paused:
+                self.toggle_pause(now)
+
+    def close_menu(self, now: float) -> None:
+        self.menu_open = False
+        self.in_settings = False
+        if self.paused:
+            self.toggle_pause(now)
+
+    def toggle_pause(self, now: float) -> None:
+        if self.paused:
+            self.elapsed_pause += now - self._pause_started
+            self.paused = False
+        else:
+            self._pause_started = now
+            self.paused = True
+
+    def restart(self) -> None:
+        args, stdscr = self.args, self.stdscr
+        saved = (self.skin_name, self.theme_name, self.speed_name,
+                 self.lives_cfg, self.mono)
+        best, new_best = self.best, self.new_best
+        self.__init__(stdscr, args)
+        (self.skin_name, self.theme_name, self.speed_name,
+         self.lives_cfg, self.mono) = saved
+        self.engine.speed_mult = SPEEDS[self.speed_name]
+        self.engine.max_lives = self.lives_cfg
+        self.engine.lives = self.lives_cfg
+        self.best, self.new_best = best, new_best
+        _init_colors(self.theme_name)
+
+    def on_game_over(self) -> None:
+        if self.engine.score > self.best:
+            self.best = self.engine.score
+            self.new_best = True
+            save_best(self.engine.score)
+
+    # -- input ----------------------------------------------------------------------
+    def handle_key(self, key: int, now: float) -> str | None:
+        import curses
+        e = self.engine
+        KEY_MOUSE = getattr(curses, "KEY_MOUSE", -9999)
+        if key == KEY_MOUSE:
+            return self.handle_mouse()
+
+        if self.menu_open and self.in_settings:
+            if key in (27, ord("b"), ord("B")):
+                self.in_settings = False
+                return None
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.settings_index = (self.settings_index - 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.settings_index = (self.settings_index + 1) % len(self.settings_rows())
+                return None
+            if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
+                self.adjust_setting(-1)
+                return None
+            if key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
+                self.adjust_setting(+1)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                self.adjust_setting(+1)
+                return None
+            if key in (ord("q"), ord("Q")):
+                self.in_settings = False
+                return None
+            return None
+
+        if self.menu_open:
+            if key in (curses.KEY_UP, ord("w"), ord("W")):
+                self.menu_index = (self.menu_index - 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                self.menu_index = (self.menu_index + 1) % len(self.menu_items)
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return self.activate_menu_item(now)
+            if key == 27:
+                self.close_menu(now)
+                return None
+            if key in (ord("p"), ord("P"), ord("c"), ord("C")):
+                self.close_menu(now)
+                return None
+            if key in (ord("r"), ord("R")):
+                self.restart()
+                return None
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            for i in range(len(self.menu_items)):
+                if key == ord(str(i + 1)):
+                    self.menu_index = i
+                    return self.activate_menu_item(now)
+            return None
+
+        if e.game_over:
+            if key in (curses.KEY_LEFT, curses.KEY_RIGHT, 9):
+                self.over_index = 1 - self.over_index
+                return None
+            if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return "restart" if self.over_index == 0 else "quit"
+            if key in (ord("r"), ord("R")):
+                return "restart"
+            if key in (ord("q"), ord("Q"), 27):
+                return "quit"
+            return None
+
+        if key == 27:
+            self.open_menu(now)
+            return None
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if key in (ord("p"), ord("P")):
+            self.open_menu(now)
+            return None
+        if key in (ord("r"), ord("R")):
+            return "restart"
+        if key in (ord("m"), ord("M")):
+            self.mono = not self.mono
+            self.persist_settings()
+            return None
+        if self.paused:
+            return None
+        # exactly ONE cell per key event; holding streams terminal repeats
+        if key in (curses.KEY_LEFT, ord("h"), ord("H"), ord("a"), ord("A")):
+            e.nudge_paddle(-1)
+        elif key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("d"), ord("D")):
+            e.nudge_paddle(+1)
+        elif key == ord(" "):
+            e.launch()
+        return None
+
+    def activate_menu_item(self, now: float) -> str | None:
+        item = self.menu_items[self.menu_index]
+        if item == "Continue":
+            self.close_menu(now)
+        elif item == "Restart":
+            self.restart()
+        elif item == "Settings":
+            self.in_settings = True
+            self.settings_index = 0
+        elif item == "Quit":
+            return "quit"
+        return None
+
+    def handle_mouse(self) -> str | None:
+        import curses
+        now = time.monotonic()
+        try:
+            _id, mx, my, _z, _b = curses.getmouse()
+        except Exception:
+            return None
+        for (bid, by, bx, bw) in self._menu_buttons:
+            if by == my and bx <= mx < bx + bw:
+                if self.engine.game_over and not self.menu_open:
+                    return "restart" if bid == "over_restart" else "quit"
+                if self.menu_open and not self.in_settings:
+                    for i in range(len(self.menu_items)):
+                        if bid == f"menu_{i}":
+                            self.menu_index = i
+                            return self.activate_menu_item(now)
+                elif self.menu_open and self.in_settings:
+                    if bid == "set_back":
+                        self.in_settings = False
+        return None
+
+    # -- main loop --------------------------------------------------------------------
+    def run(self) -> None:
+        import curses
+        stdscr = self.stdscr
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(8)
+        stdscr.keypad(True)
+        try:
+            curses.set_escdelay(25)
+        except Exception:
+            pass
+        try:
+            _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
+                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+            curses.mousemask(_mm)
+        except Exception:
+            pass
+        _init_colors(self.theme_name)
+
+        prev = time.monotonic()
+        while True:
+            now = time.monotonic()
+            dt = min(0.05, now - prev)
+            prev = now
+            while True:
+                try:
+                    key = stdscr.getch()
+                except Exception:
+                    key = -1
+                if key == -1:
+                    break
+                sig = self.handle_key(key, now)
+                if sig == "quit":
+                    self.on_game_over()
+                    return
+                if sig == "restart":
+                    self.restart()
+                    prev = time.monotonic()
+                    break
+            if not self.paused and not self.engine.game_over:
+                self.engine.update(dt)
+                if self.engine.game_over:
+                    self.on_game_over()
+            self.render(now)
+            elapsed = time.monotonic() - now
+            if elapsed < 0.005:
+                time.sleep(0.005 - elapsed)
+
+    # -- rendering ----------------------------------------------------------------------
+    def pair(self, name: str) -> int:
+        import curses
+        table = {"ball": 1, "paddle": 2, "brick": 3, "wall": 4}
+        try:
+            if self.mono:
+                return curses.color_pair(20)
+            return curses.color_pair(table.get(name, 20))
+        except Exception:
+            return curses.A_NORMAL
+
+    def put(self, x: int, y: int, text: str, attr: int = 0) -> None:
+        try:
+            self.stdscr.addstr(y, x, text, attr)
+        except Exception:
+            pass
+
+    def text_box(self, x: int, y: int, w: int, h: int, title: str = "") -> None:
+        import curses
+        if h <= 0:
+            return
+        try:
+            self.stdscr.addstr(y, x, "┌" + "─" * (w - 2) + "┐", curses.A_DIM)
+            for i in range(1, h - 1):
+                self.stdscr.addstr(y + i, x, "│", curses.A_DIM)
+                self.stdscr.addstr(y + i, x + w - 1, "│", curses.A_DIM)
+            self.stdscr.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.A_DIM)
+            if title:
+                self.stdscr.addstr(y, x + 2, f" {title} ", curses.A_BOLD)
+        except Exception:
+            pass
+
+    def mattr(self, kind: str) -> int:
+        import curses
+        if kind in ("sel", "title"):
+            return curses.A_REVERSE | curses.A_BOLD
+        if kind == "hint":
+            return curses.A_DIM
+        return curses.A_BOLD
+
+    def render(self, now: float) -> None:
+        import curses
+        stdscr = self.stdscr
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        panel_w = 16
+        total_w = panel_w + (FIELD_W + 2) + panel_w + 6
+        min_w, min_h = total_w, FIELD_H + 7
+        if maxx < min_w or maxy < min_h:
+            for i, line in enumerate([
+                    "Terminal too small for Alien-Break.",
+                    f"Need at least {min_w}x{min_h}, you have {maxx}x{maxy}.",
+                    "Resize or press Q to quit."]):
+                try:
+                    stdscr.addstr(maxy // 2 - 1 + i, max(0, (maxx - len(line)) // 2),
+                                  line, curses.A_BOLD)
+                except Exception:
+                    pass
+            stdscr.refresh()
+            return
+
+        e = self.engine
+        sk = self.skin()
+        ox = max(0, (maxx - total_w) // 2)
+        oy = max(1, (maxy - (FIELD_H + 5)) // 2)
+        lx, fx, rx = ox, ox + panel_w + 3, ox + panel_w + 3 + FIELD_W + 2 + 3
+
+        try:
+            stdscr.addstr(max(0, oy - 1), max(0, (maxx - 15) // 2), " A L I E N - B R E A K ",
+                          curses.A_BOLD | self.pair("ball"))
+        except Exception:
+            pass
+
+        # scoreboard
+        score = f"{e.score:,} pts · level {e.level}"
+        try:
+            stdscr.addstr(oy, fx + (FIELD_W + 2 - len(score)) // 2, score,
+                          curses.A_BOLD)
+            sub = f"♥×{e.lives} · {len(e.bricks)} bricks left"
+            stdscr.addstr(oy + 1, fx + (FIELD_W + 2 - len(sub)) // 2, sub,
+                          curses.A_DIM)
+        except Exception:
+            pass
+
+        fy = oy + 2
+        # frame
+        try:
+            stdscr.addstr(fy, fx, "┌" + "─" * FIELD_W + "┐", curses.A_DIM)
+            for i in range(FIELD_H):
+                stdscr.addstr(fy + 1 + i, fx, "│", curses.A_DIM)
+                stdscr.addstr(fy + 1 + i, fx + FIELD_W + 1, "│", curses.A_DIM)
+            # no bottom wall — missing the ball costs a life
+            stdscr.addstr(fy + FIELD_H + 1, fx, "└" + "─" * FIELD_W + "┘",
+                          curses.A_DIM)
+        except Exception:
+            pass
+        # bricks
+        for (c, r) in e.bricks:
+            x0, y0, x1, _y1 = brick_rect(c, r)
+            w = max(1, int(round(x1 - x0)))
+            self.put(fx + 1 + int(round(x0)), fy + 1 + r,
+                     sk["brick"] * w, self.pair("brick") | curses.A_BOLD)
+        # paddle
+        for i in range(PADDLE_W):
+            self.put(fx + 1 + int(e.paddle_x) + i, fy + 1 + PADDLE_Y,
+                     sk["paddle"], self.pair("paddle") | curses.A_BOLD)
+        # ball
+        self.put(fx + 1 + int(round(e.ball["x"])),
+                 fy + 1 + int(round(e.ball["y"])),
+                 sk["ball"], self.pair("ball") | curses.A_BOLD)
+
+        # left panel
+        self.text_box(lx, oy, panel_w, 9, "BREAKOUT")
+        for i, s in enumerate([
+                f"Score {e.score:>8,}",
+                f"Best  {max(self.best, e.score):>8,}",
+                f"Lives {'♥' * e.lives:>8}",
+                f"Level {e.level:>8}",
+                f"Left  {len(e.bricks):>8}",
+        ]):
+            self.put(lx + 2, oy + 2 + i, s[: panel_w - 3])
+        self.text_box(lx, oy + 10, panel_w, 6, f"{self.skin_name.upper()}")
+        self.put(lx + 2, oy + 12, f"{sk['ball']} ball")
+        self.put(lx + 2, oy + 13, f"{sk['brick']} brick")
+
+        # right panel: help
+        self.text_box(rx, oy, panel_w, 10, "HELP")
+        for i, s in enumerate([
+                "←→ 1 cell", "hold = run", "SPACE launch",
+                "clear bricks!", "top pays more", "ESC menu",
+                "R restart", "Q quit",
+        ][:8]):
+            if oy + 2 + i < oy + 10 - 1:
+                self.put(rx + 2, oy + 2 + i, s[: panel_w - 3])
+
+        try:
+            status = self.status_line()
+            stdscr.addstr(maxy - 1, max(0, (maxx - len(status)) // 2),
+                          status[: maxx - 1], curses.A_DIM)
+        except Exception:
+            pass
+
+        if self.menu_open:
+            if self.in_settings:
+                self.draw_settings_menu()
+            else:
+                self.draw_pause_menu()
+        elif e.game_over:
+            self.draw_gameover_menu()
+        elif e.countdown > 0:
+            self.center_banner("READY!")
+        elif e.stuck:
+            self.center_banner("SPACE to launch!")
+
+        stdscr.refresh()
+
+    def status_line(self) -> str:
+        e = self.engine
+        if e.game_over:
+            return "Game over — ←→ choose · Enter select · Q quit"
+        if self.menu_open:
+            return "Menu — ↑↓ choose · Enter select · ESC continue"
+        return (f"{e.score:,} pts · Lv {e.level} · ♥×{e.lives} · "
+                f"{self.skin_name}/{self.theme_name} · ESC menu")
+
+    def center_banner(self, text: str) -> None:
+        import curses
+        maxy, maxx = self.stdscr.getmaxyx()
+        try:
+            self.stdscr.addstr(maxy // 2, (maxx - len(text)) // 2, text,
+                               curses.A_REVERSE | curses.A_BOLD)
+        except Exception:
+            pass
+
+    # -- menus (same white/reverse look as the other games) ------------------------
+    def menu_button(self, y: int, x: int, label: str, selected: bool,
+                    bid: str) -> int:
+        text = f"[ {label} ]"
+        if selected:
+            text = f"[▶ {label} ]"
+        w = len(text)
+        try:
+            self.stdscr.addstr(y, x, text, self.mattr("sel") if selected
+                               else self.mattr("text"))
+        except Exception:
+            pass
+        self._menu_buttons.append((bid, y, x, w))
+        return w
+
+    def menu_panel(self, title: str, inner_h: int, inner_w: int):
+        maxy, maxx = self.stdscr.getmaxyx()
+        w, h = inner_w + 6, inner_h + 4
+        x0, y0 = max(0, (maxx - w) // 2), max(0, (maxy - h) // 2)
+        try:
+            # solid fill: wipe the field behind the menu (non-transparent)
+            for yy in range(y0 + 1, min(maxy, y0 + h - 1)):
+                self.stdscr.addstr(yy, x0 + 1, " " * (w - 2),
+                                   self.mattr("text"))
+            self.stdscr.addstr(y0, x0, "┌" + "─" * (w - 2) + "┐",
+                               self.mattr("text"))
+            for yy in range(y0 + 1, y0 + h - 1):
+                self.stdscr.addstr(yy, x0, "│", self.mattr("text"))
+                self.stdscr.addstr(yy, x0 + w - 1, "│", self.mattr("text"))
+            self.stdscr.addstr(y0 + h - 1, x0, "└" + "─" * (w - 2) + "┘",
+                               self.mattr("text"))
+            self.stdscr.addstr(y0 + 1, x0 + (w - len(title)) // 2, title,
+                               self.mattr("title"))
+        except Exception:
+            pass
+        return x0, y0
+
+    def draw_pause_menu(self) -> None:
+        self._menu_buttons = []
+        e = self.engine
+        inner_w = 30
+        x0, y0 = self.menu_panel(f"Ⅱ PAUSED — {e.score:,} pts",
+                                 len(self.menu_items) + 3, inner_w)
+        try:
+            for i, item in enumerate(self.menu_items):
+                self.menu_button(y0 + 3 + i,
+                                 x0 + (inner_w + 6 - (len(item) + 6)) // 2,
+                                 f"{i + 1}. {item}", i == self.menu_index,
+                                 f"menu_{i}")
+            hint = "↑↓ navigate · Enter select · ESC continue"
+            self.stdscr.addstr(y0 + 3 + len(self.menu_items) + 1,
+                               x0 + (inner_w + 6 - len(hint)) // 2, hint,
+                               self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_settings_menu(self) -> None:
+        rows = self.settings_rows()
+        inner_w = 36
+        x0, y0 = self.menu_panel("⚙ SETTINGS", len(rows) + 3, inner_w)
+        hint = "↑↓ row · ←→ change · ESC back"
+        hy, hx = y0 + 3 + len(rows) + 1, x0 + (inner_w + 6 - len(hint)) // 2
+        self._menu_buttons = [("set_back", hy, hx, len(hint))]
+        try:
+            for i, (name, val) in enumerate(rows):
+                by = y0 + 3 + i
+                marker = "▶" if i == self.settings_index else " "
+                self.stdscr.addstr(by, x0 + 3, f"{marker} {name}"[:22].ljust(22),
+                                   self.mattr("sel") if i == self.settings_index
+                                   else self.mattr("text"))
+                self.stdscr.addstr(by, x0 + 3 + 23, f"< {val} >",
+                                   self.mattr("title"))
+            self.stdscr.addstr(hy, hx, hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+    def draw_gameover_menu(self) -> None:
+        e = self.engine
+        hs = max(self.best, e.score)
+        title = "GAME OVER" + ("  ★ NEW BEST!" if self.new_best else "")
+        stats = [f"Score  {e.score:,}", f"Level  {e.level}   Best {hs:,}"]
+        inner_w = 32
+        x0, y0 = self.menu_panel(title, len(stats) + 4, inner_w)
+        by = y0 + 3 + len(stats) + 1
+        b0 = "[▶ Retry ]" if self.over_index == 0 else "[ Retry ]"
+        b1 = "[▶ Quit ]" if self.over_index == 1 else "[ Quit ]"
+        gap = 4
+        bx = x0 + (inner_w + 6 - (len(b0) + gap + len(b1))) // 2
+        self._menu_buttons = [("over_restart", by, bx, len(b0)),
+                              ("over_quit", by, bx + len(b0) + gap, len(b1))]
+        try:
+            for i, s in enumerate(stats):
+                self.stdscr.addstr(y0 + 3 + i, x0 + (inner_w + 6 - len(s)) // 2,
+                                   s, self.mattr("title"))
+            self.stdscr.addstr(by, bx, b0, self.mattr("sel") if self.over_index == 0
+                               else self.mattr("text"))
+            self.stdscr.addstr(by, bx + len(b0) + gap, b1,
+                               self.mattr("sel") if self.over_index == 1
+                               else self.mattr("text"))
+            hint = "←→ choose · Enter select · R retry"
+            self.stdscr.addstr(by + 2, x0 + (inner_w + 6 - len(hint)) // 2,
+                               hint, self.mattr("hint"))
+        except Exception:
+            pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Alien-Break — terminal Breakout clone")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed")
+    parser.add_argument("--test", action="store_true", help="run headless self-test and exit")
+    parser.add_argument("--mono", action="store_true", help="disable colors")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_selftest()
+
+    try:
+        import curses  # noqa
+    except Exception as exc:
+        if os.name == "nt":
+            print("Install windows-curses first: pip install windows-curses",
+                  file=sys.stderr)
+            return 2
+        print(f"curses is required: {exc}", file=sys.stderr)
+        return 2
+    import curses
+
+    def _wrapped(stdscr):
+        CursesApp(stdscr, args).run()
+
+    try:
+        curses.wrapper(_wrapped)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Headless self-test
+# --------------------------------------------------------------------------
+
+def run_selftest() -> int:
+    fails = []
+
+    def check(name: str, cond: bool, detail: str = ""):
+        print(("PASS " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    # 1. layouts valid: 5 rows of 12, at least one brick each
+    ok = all(len(L) == BRICK_ROWS and all(len(r) == BRICK_COLS for r in L)
+             for L in LAYOUTS) and all(any("#" in r for r in L) for L in LAYOUTS)
+    check("layouts-valid", ok)
+    # 2. launch fires the ball upward
+    e = BreakEngine(seed=1)
+    e.countdown = 0
+    check("stuck-before-launch", e.stuck and e.ball["vy"] == 0.0)
+    check("launch-fires", e.launch() and not e.stuck and e.ball["vy"] < 0)
+    # 3. one press moves paddle exactly one cell
+    x0 = e.paddle_x
+    e.nudge_paddle(+1)
+    check("paddle-one-cell", e.paddle_x == x0 + 1, f"{x0} -> {e.paddle_x}")
+    e.paddle_x = 0.0
+    e.nudge_paddle(-1)
+    check("paddle-clamp", e.paddle_x == 0.0)
+    # 4. wall bounces
+    e2 = BreakEngine(seed=2)
+    e2.countdown = 0
+    e2.launch()
+    e2.ball.update({"x": 0.6, "y": 10.0, "vx": -10.0, "vy": 0.0})
+    e2.update(0.05)
+    check("side-bounce", e2.ball["vx"] > 0, str(e2.ball))
+    e2.ball.update({"x": 20.0, "y": 0.6, "vx": 0.0, "vy": -10.0})
+    e2.update(0.05)
+    check("ceiling-bounce", e2.ball["vy"] > 0, str(e2.ball))
+    # 5. paddle bounce goes back up
+    e3 = BreakEngine(seed=3)
+    e3.countdown = 0
+    e3.launch()
+    e3.ball.update({"x": e3.paddle_x + PADDLE_W / 2, "y": PADDLE_Y - 1.0,
+                    "vx": 0.0, "vy": 12.0})
+    e3.update(0.1)
+    check("paddle-bounce", e3.ball["vy"] < 0, str(e3.ball))
+    # 6. brick breaks + scores (top rows pay most)
+    e4 = BreakEngine(seed=4)
+    e4.countdown = 0
+    e4.launch()
+    n0, s0 = len(e4.bricks), e4.score
+    e4.ball.update({"x": 1.0, "y": BRICK_TOP + 1.1, "vx": 0.0, "vy": -8.0})
+    e4.update(0.02)  # single substep: exactly one brick
+    check("brick-breaks", len(e4.bricks) == n0 - 1 and e4.score == s0 + 50,
+          f"bricks={len(e4.bricks)} score={e4.score}")
+    # 7. missing costs a life; last one ends the run
+    e5 = BreakEngine(seed=5)
+    e5.countdown = 0
+    e5.launch()
+    e5.ball.update({"x": 20.0, "y": FIELD_H - 0.5, "vx": 0.0, "vy": 15.0})
+    lives = e5.lives
+    e5.update(0.2)
+    check("miss-costs-life", e5.lives == lives - 1 and e5.stuck)
+    e5.lives = 1
+    e5.launch()
+    e5.ball.update({"x": 20.0, "y": FIELD_H - 0.5, "vx": 0.0, "vy": 15.0})
+    e5.update(0.2)
+    check("last-life-ends-run", e5.game_over)
+    # 8. clearing bricks advances a level with fresh bricks
+    e6 = BreakEngine(seed=6)
+    e6.countdown = 0
+    e6.launch()
+    e6.bricks = {(0, 4)}
+    e6.ball.update({"x": 1.0, "y": BRICK_TOP + 5.4, "vx": 0.0, "vy": -8.0})
+    lv = e6.level
+    e6.update(0.1)
+    check("level-clear", e6.level == lv + 1 and len(e6.bricks) > 10)
+    # 9. ball never goes near-horizontal
+    import math
+    e7 = BreakEngine(seed=7)
+    e7.countdown = 0
+    e7.launch()
+    bad = 0
+    for _ in range(3000):
+        e7.update(0.03)
+        sp = math.hypot(e7.ball["vx"], e7.ball["vy"])
+        if sp > 0 and abs(e7.ball["vy"]) < sp * MIN_VY_FRACTION - 1e-6:
+            bad += 1
+        if e7.game_over or e7.stuck:
+            e7.launch() if e7.lives > 0 else None
+            if e7.game_over:
+                break
+    check("no-flat-loops", bad == 0, f"{bad} flat frames")
+    # 10. skins distinct + themes valid
+    ok = len({SKINS[n]["ball"] for n in SKINS}) == len(SKINS)
+    ok = ok and len({SKINS[n]["paddle"] for n in SKINS}) == len(SKINS)
+    ok = ok and len({SKINS[n]["brick"] for n in SKINS}) == len(SKINS)
+    check("skins-distinct", ok)
+    ok = all(set(t) == {"ball", "paddle", "brick", "wall"} for t in THEMES.values())
+    check("themes-valid", ok)
+
+    total = 15
+    print(f"\n{total - len(fails)}/{total} checks passed.")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
