@@ -114,6 +114,7 @@ Auto = classic slide-until-wall), reset best.
 |-----|--------|
 | `↑` / `W` / `K` | paddle up — one cell per press (hold to run) |
 | `↓` / `S` / `J` | paddle down — one cell per press (hold to run) |
+| Mouse | optional paddle-follow (Settings → Paddle follows) |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
 | `R` / `Q` | quick restart / quit |
 | `M` | toggle colors |
@@ -130,6 +131,7 @@ AI difficulty (Easy/Normal/Hard), win score (5/7/11), reset records.
 | Key | Action |
 |-----|--------|
 | `←` / `→` / `H` / `L` | paddle — one cell per press (hold to run) |
+| Mouse | optional paddle-follow (Settings → Paddle follows) |
 | `SPACE` | launch the ball |
 | `ESC` / `P` | pause menu: Continue · Restart · Settings · Quit |
 | `R` / `Q` | quick restart / quit |

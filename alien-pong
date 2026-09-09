@@ -8,6 +8,7 @@ Alien-Pong — single-player Pong for the Linux terminal.
 Controls:
   ↑ / W / K              paddle up one cell per press (hold to run)
   ↓ / S / J              paddle down one cell per press (hold to run)
+  Mouse                  optional: paddle follows the cursor (Settings)
   ESC / P                pause menu (Continue · Restart · Settings · Quit)
   R                      quick restart
   Q                      quit
@@ -77,6 +78,10 @@ DIFFICULTY = {
 DIFF_NAMES = list(DIFFICULTY.keys())
 WIN_SCORES = [5, 7, 11]
 
+# Paddle input: Keys (tap/hold) or Mouse (paddle follows the cursor;
+# keys keep working as a fallback in both modes).
+PADDLE_MODES = ["Keys", "Mouse"]
+
 
 def load_best() -> dict:
     defaults = {"best_rally": 0, "wins": 0}
@@ -103,7 +108,8 @@ def save_best(best_rally: int, wins: int) -> None:
 
 def load_settings() -> dict:
     defaults = {"skin": "Alien", "theme": "Classic", "speed": "Normal",
-                "difficulty": "Normal", "win": 7, "mono": False}
+                "difficulty": "Normal", "win": 7, "paddle": "Keys",
+                "mono": False}
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -120,17 +126,20 @@ def load_settings() -> dict:
             defaults["difficulty"] = "Normal"
         if defaults["win"] not in WIN_SCORES:
             defaults["win"] = 7
+        if defaults["paddle"] not in PADDLE_MODES:
+            defaults["paddle"] = "Keys"
     except Exception:
         pass
     return defaults
 
 
 def save_settings(skin: str, theme: str, speed: str, difficulty: str,
-                  win: int, mono: bool) -> None:
+                  win: int, paddle: str, mono: bool) -> None:
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump({"skin": skin, "theme": theme, "speed": speed,
-                       "difficulty": difficulty, "win": win, "mono": mono}, f)
+                       "difficulty": difficulty, "win": win,
+                       "paddle": paddle, "mono": mono}, f)
     except Exception:
         pass
 
@@ -208,6 +217,11 @@ class PongEngine:
         """Smooth held-key motion: constant velocity, framerate-independent."""
         self.left_y = min(max(self.left_y + direction * GLIDE_SPEED *
                               self.speed_mult * dt, 0.0),
+                          FIELD_H - PADDLE_H)
+
+    def aim_mouse(self, mouse_y: float, field_top: float) -> None:
+        """Bind the paddle to the cursor: center it on the pointer row."""
+        self.left_y = min(max(mouse_y - field_top - PADDLE_H / 2, 0.0),
                           FIELD_H - PADDLE_H)
 
     # -- paddles --------------------------------------------------------------
@@ -334,6 +348,7 @@ class CursesApp:
         self.speed_name = cfg["speed"]
         self.diff_name = cfg["difficulty"]
         self.win_score = cfg["win"]
+        self.paddle_mode = cfg["paddle"]
         self.mono = cfg["mono"] or args.mono
         self.engine = PongEngine(seed=args.seed, speed=self.speed_name,
                                  difficulty=self.diff_name,
@@ -350,6 +365,7 @@ class CursesApp:
         self.settings_index = 0
         self.over_index = 0
         self._menu_buttons: list[tuple[str, int, int, int]] = []
+        self._field_top: float | None = None  # screen row of field row 0
         # hold-tracking: press = 1 cell instantly, hold past HOLD_DAS glides.
         # Repeat events while held only refresh the timestamps (no bursts).
         self._up_press = 0.0
@@ -370,8 +386,10 @@ class CursesApp:
             ("Ball/paddle skin", self.skin_name),
             ("Theme", self.theme_name),
             ("Speed", self.speed_name),
+            ("Paddle follows", self.paddle_mode),
             ("AI difficulty", self.diff_name),
             ("Win score", str(self.win_score)),
+            ("Colors", "OFF (mono)" if self.mono else "ON"),
             ("Reset records", "press →"),
         ]
 
@@ -392,16 +410,21 @@ class CursesApp:
             self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
             self.engine.speed_mult = SPEEDS[self.speed_name]
         elif i == 3 and direction != 0:
+            cur = PADDLE_MODES.index(self.paddle_mode)
+            self.paddle_mode = PADDLE_MODES[(cur + direction) % len(PADDLE_MODES)]
+        elif i == 4 and direction != 0:
             cur = DIFF_NAMES.index(self.diff_name)
             self.diff_name = DIFF_NAMES[(cur + direction) % len(DIFF_NAMES)]
             diff = DIFFICULTY[self.diff_name]
             self.engine.ai_speed = diff["speed"]
             self.engine.ai_error = diff["error"]
-        elif i == 4 and direction != 0:
+        elif i == 5 and direction != 0:
             cur = WIN_SCORES.index(self.win_score)
             self.win_score = WIN_SCORES[(cur + direction) % len(WIN_SCORES)]
             self.engine.win_score = self.win_score
-        elif i == 5 and direction != 0:
+        elif i == 6 and direction != 0:
+            self.mono = not self.mono
+        elif i == 7 and direction != 0:
             self.best_rally = 0
             self.wins = 0
             try:
@@ -413,7 +436,8 @@ class CursesApp:
 
     def persist_settings(self) -> None:
         save_settings(self.skin_name, self.theme_name, self.speed_name,
-                      self.diff_name, self.win_score, self.mono)
+                      self.diff_name, self.win_score, self.paddle_mode,
+                      self.mono)
 
     # -- menu state -------------------------------------------------------------
     def open_menu(self, now: float) -> None:
@@ -443,18 +467,22 @@ class CursesApp:
     def restart(self) -> None:
         args, stdscr = self.args, self.stdscr
         saved = (self.skin_name, self.theme_name, self.speed_name,
-                 self.diff_name, self.win_score, self.mono)
+                 self.diff_name, self.win_score, self.paddle_mode, self.mono)
         best_rally, wins, new_best = self.best_rally, self.wins, self.new_best
         self.__init__(stdscr, args)
         (self.skin_name, self.theme_name, self.speed_name,
-         self.diff_name, self.win_score, self.mono) = saved
+         self.diff_name, self.win_score, self.paddle_mode,
+         self.mono) = saved
         self.engine.speed_mult = SPEEDS[self.speed_name]
         diff = DIFFICULTY[self.diff_name]
         self.engine.ai_speed = diff["speed"]
         self.engine.ai_error = diff["error"]
         self.engine.win_score = self.win_score
         self.best_rally, self.wins, self.new_best = best_rally, wins, new_best
-        _init_colors(self.theme_name)
+        try:
+            _init_colors(self.theme_name)
+        except Exception:
+            pass
 
     def on_game_over(self) -> None:
         e = self.engine
@@ -619,6 +647,14 @@ class CursesApp:
                 elif self.menu_open and self.in_settings:
                     if bid == "set_back":
                         self.in_settings = False
+                        return None
+        # in-game: paddle follows the cursor when Mouse mode is on
+        # (keys keep working too, as a fallback for terminals without
+        # mouse-motion reports)
+        if (not self.menu_open and not self.engine.game_over
+                and not self.paused and self.paddle_mode == "Mouse"
+                and self._field_top is not None):
+            self.engine.aim_mouse(my, self._field_top)
         return None
 
     # -- main loop ------------------------------------------------------------------
@@ -635,7 +671,9 @@ class CursesApp:
             pass
         try:
             _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
-                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+                curses, "BUTTON1_PRESSED", 0) | getattr(
+                curses, "REPORT_MOUSE_POSITION", 0) or getattr(
+                curses, "ALL_MOUSE_EVENTS", 0)
             curses.mousemask(_mm)
         except Exception:
             pass
@@ -756,6 +794,7 @@ class CursesApp:
             pass
 
         fy = oy + 2
+        self._field_top = fy + 1  # mouse rows map here (see aim_mouse)
         # frame
         try:
             stdscr.addstr(fy, fx, "┌" + "─" * FIELD_W + "┐", curses.A_DIM)
@@ -798,8 +837,10 @@ class CursesApp:
 
         # right panel: help
         self.text_box(rx, oy, panel_w, 10, "HELP")
+        move_line = ("mouse moves!" if self.paddle_mode == "Mouse"
+                     else "↑/W · 1 cell")
         for i, s in enumerate([
-                "↑/W up · 1 cell", "↓/S down · 1 cell", "hold key = run", "ESC menu",
+                move_line, "↓/S · 1 cell", "hold key = run", "ESC menu",
                 "R restart", "Q quit", "M colors",
         ]):
             self.put(rx + 2, oy + 2 + i, s[: panel_w - 3])
@@ -1058,6 +1099,15 @@ def run_selftest() -> int:
           str(e9.left_y))
     e9.glide(5.0, +1)
     check("glide-clamps", e9.left_y == FIELD_H - PADDLE_H)
+    # 8. mouse aim centers the paddle on the cursor, clamped at edges
+    e10 = PongEngine(seed=10)
+    e10.aim_mouse(10.0, 0.0)
+    check("mouse-centers", abs(e10.left_y - 8.0) < 1e-6, str(e10.left_y))
+    e10.aim_mouse(-50.0, 0.0)
+    check("mouse-clamps", e10.left_y == 0.0)
+    e10.aim_mouse(500.0, 0.0)
+    check("mouse-clamps-far", e10.left_y == FIELD_H - PADDLE_H)
+    check("paddle-modes", PADDLE_MODES == ["Keys", "Mouse"])
     # 7. skins distinct + themes valid
     ok = len({SKINS[n]["ball"] for n in SKINS}) == len(SKINS)
     ok = ok and len({SKINS[n]["paddle"] for n in SKINS}) == len(SKINS)
@@ -1080,7 +1130,7 @@ def run_selftest() -> int:
     except Exception as exc:
         check("match-completes", False, str(exc))
 
-    total = 17
+    total = 21
     print(f"\n{total - len(fails)}/{total} checks passed.")
     return 1 if fails else 0
 

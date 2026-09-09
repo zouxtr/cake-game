@@ -7,6 +7,7 @@ Alien-Break — a Breakout clone for the Linux terminal.
 
 Controls:
   ← / →  or  H / L   move paddle ONE cell per press (hold to run)
+  Mouse              optional: paddle follows the cursor (Settings)
   SPACE              launch the ball / relaunch after losing one
   ESC / P            pause menu (Continue · Restart · Settings · Quit)
   R                  quick restart
@@ -72,6 +73,10 @@ SPEEDS = {"Chill": 0.8, "Normal": 1.0, "Turbo": 1.25}
 SPEED_NAMES = list(SPEEDS.keys())
 LIVES_OPTIONS = [3, 5]
 
+# Paddle input: Keys (tap/hold) or Mouse (paddle follows the cursor;
+# keys keep working as a fallback in both modes).
+PADDLE_MODES = ["Keys", "Mouse"]
+
 # Brick layouts over a 12x5 grid ('#' = brick). Cycled per level.
 LAYOUTS = [
     [
@@ -125,7 +130,7 @@ def save_best(score: int) -> None:
 
 def load_settings() -> dict:
     defaults = {"skin": "Alien", "theme": "Classic", "speed": "Normal",
-                "lives": 3, "mono": False}
+                "lives": 3, "paddle": "Keys", "mono": False}
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -140,17 +145,19 @@ def load_settings() -> dict:
             defaults["speed"] = "Normal"
         if defaults["lives"] not in LIVES_OPTIONS:
             defaults["lives"] = 3
+        if defaults["paddle"] not in PADDLE_MODES:
+            defaults["paddle"] = "Keys"
     except Exception:
         pass
     return defaults
 
 
 def save_settings(skin: str, theme: str, speed: str, lives: int,
-                  mono: bool) -> None:
+                  paddle: str, mono: bool) -> None:
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump({"skin": skin, "theme": theme, "speed": speed,
-                       "lives": lives, "mono": mono}, f)
+                       "lives": lives, "paddle": paddle, "mono": mono}, f)
     except Exception:
         pass
 
@@ -224,6 +231,12 @@ class BreakEngine:
         if self.stuck:
             self.ball["x"] = min(max(self.ball["x"] + dx,
                                      0.5), FIELD_W - 0.5)
+
+    def aim_mouse(self, mouse_x: float, field_left: float) -> None:
+        """Bind the paddle to the cursor: center it on the pointer column
+        (a stuck ball rides along)."""
+        target = mouse_x - field_left - PADDLE_W / 2
+        self._shift(target - self.paddle_x)
 
     def update(self, dt: float) -> None:
         if self.game_over:
@@ -389,6 +402,7 @@ class CursesApp:
         self.theme_name = cfg["theme"]
         self.speed_name = cfg["speed"]
         self.lives_cfg = cfg["lives"]
+        self.paddle_mode = cfg["paddle"]
         self.mono = cfg["mono"] or args.mono
         self.engine = BreakEngine(seed=args.seed, speed=self.speed_name,
                                   lives=self.lives_cfg)
@@ -402,6 +416,7 @@ class CursesApp:
         self.settings_index = 0
         self.over_index = 0
         self._menu_buttons: list[tuple[str, int, int, int]] = []
+        self._field_left: float | None = None  # screen col of field col 0
         # hold-tracking: press = 1 cell instantly, hold past HOLD_DAS glides.
         self._left_press = 0.0
         self._left_last = -99.0
@@ -421,6 +436,7 @@ class CursesApp:
             ("Ball/brick skin", self.skin_name),
             ("Theme", self.theme_name),
             ("Speed", self.speed_name),
+            ("Paddle follows", self.paddle_mode),
             ("Lives", str(self.lives_cfg)),
             ("Colors", "OFF (mono)" if self.mono else "ON"),
             ("Reset best", "press →"),
@@ -443,12 +459,15 @@ class CursesApp:
             self.speed_name = SPEED_NAMES[(cur + direction) % len(SPEED_NAMES)]
             self.engine.speed_mult = SPEEDS[self.speed_name]
         elif i == 3 and direction != 0:
+            cur = PADDLE_MODES.index(self.paddle_mode)
+            self.paddle_mode = PADDLE_MODES[(cur + direction) % len(PADDLE_MODES)]
+        elif i == 4 and direction != 0:
             cur = LIVES_OPTIONS.index(self.lives_cfg)
             self.lives_cfg = LIVES_OPTIONS[(cur + direction) % len(LIVES_OPTIONS)]
             self.engine.max_lives = self.lives_cfg
-        elif i == 4 and direction != 0:
-            self.mono = not self.mono
         elif i == 5 and direction != 0:
+            self.mono = not self.mono
+        elif i == 6 and direction != 0:
             self.best = 0
             try:
                 if os.path.exists(HIGHSCORE_PATH):
@@ -459,7 +478,7 @@ class CursesApp:
 
     def persist_settings(self) -> None:
         save_settings(self.skin_name, self.theme_name, self.speed_name,
-                      self.lives_cfg, self.mono)
+                      self.lives_cfg, self.paddle_mode, self.mono)
 
     # -- menu state ---------------------------------------------------------------
     def open_menu(self, now: float) -> None:
@@ -489,16 +508,19 @@ class CursesApp:
     def restart(self) -> None:
         args, stdscr = self.args, self.stdscr
         saved = (self.skin_name, self.theme_name, self.speed_name,
-                 self.lives_cfg, self.mono)
+                 self.lives_cfg, self.paddle_mode, self.mono)
         best, new_best = self.best, self.new_best
         self.__init__(stdscr, args)
         (self.skin_name, self.theme_name, self.speed_name,
-         self.lives_cfg, self.mono) = saved
+         self.lives_cfg, self.paddle_mode, self.mono) = saved
         self.engine.speed_mult = SPEEDS[self.speed_name]
         self.engine.max_lives = self.lives_cfg
         self.engine.lives = self.lives_cfg
         self.best, self.new_best = best, new_best
-        _init_colors(self.theme_name)
+        try:
+            _init_colors(self.theme_name)
+        except Exception:
+            pass
 
     def on_game_over(self) -> None:
         if self.engine.score > self.best:
@@ -661,6 +683,14 @@ class CursesApp:
                 elif self.menu_open and self.in_settings:
                     if bid == "set_back":
                         self.in_settings = False
+                        return None
+        # in-game: paddle follows the cursor when Mouse mode is on
+        # (keys keep working too, as a fallback for terminals without
+        # mouse-motion reports)
+        if (not self.menu_open and not self.engine.game_over
+                and not self.paused and self.paddle_mode == "Mouse"
+                and self._field_left is not None):
+            self.engine.aim_mouse(mx, self._field_left)
         return None
 
     # -- main loop --------------------------------------------------------------------
@@ -677,7 +707,9 @@ class CursesApp:
             pass
         try:
             _mm = getattr(curses, "BUTTON1_CLICKED", 0) | getattr(
-                curses, "BUTTON1_PRESSED", 0) or getattr(curses, "ALL_MOUSE_EVENTS", 0)
+                curses, "BUTTON1_PRESSED", 0) | getattr(
+                curses, "REPORT_MOUSE_POSITION", 0) or getattr(
+                curses, "ALL_MOUSE_EVENTS", 0)
             curses.mousemask(_mm)
         except Exception:
             pass
@@ -798,6 +830,7 @@ class CursesApp:
             pass
 
         fy = oy + 2
+        self._field_left = fx + 1  # mouse cols map here (see aim_mouse)
         # frame
         try:
             stdscr.addstr(fy, fx, "┌" + "─" * FIELD_W + "┐", curses.A_DIM)
@@ -840,8 +873,10 @@ class CursesApp:
 
         # right panel: help
         self.text_box(rx, oy, panel_w, 10, "HELP")
+        move_line = ("mouse moves!" if self.paddle_mode == "Mouse"
+                     else "←→ · 1 cell")
         for i, s in enumerate([
-                "←→ 1 cell", "hold = run", "SPACE launch",
+                move_line, "hold key = run", "SPACE launch",
                 "clear bricks!", "top pays more", "ESC menu",
                 "R restart", "Q quit",
         ][:8]):
@@ -1129,7 +1164,19 @@ def run_selftest() -> int:
     e9.glide(5.0, +1)
     check("glide-clamps", e9.paddle_x == FIELD_W - PADDLE_W and
           e9.ball["x"] <= FIELD_W - 0.5)
-    # 11. skins distinct + themes valid
+    # 11. mouse aim centers the paddle (stuck ball rides along), clamped
+    e10 = BreakEngine(seed=10)
+    e10.countdown = 0
+    e10.paddle_x = 0.0
+    e10.ball["x"] = 3.0
+    e10.aim_mouse(20.0, 0.0)
+    check("mouse-centers", abs(e10.paddle_x - (20.0 - PADDLE_W / 2)) < 1e-6 and
+          abs(e10.ball["x"] - (3.0 + 20.0 - PADDLE_W / 2)) < 1e-6,
+          f"{e10.paddle_x} {e10.ball['x']}")
+    e10.aim_mouse(-50.0, 0.0)
+    check("mouse-clamps", e10.paddle_x == 0.0)
+    check("paddle-modes", PADDLE_MODES == ["Keys", "Mouse"])
+    # 12. skins distinct + themes valid
     ok = len({SKINS[n]["ball"] for n in SKINS}) == len(SKINS)
     ok = ok and len({SKINS[n]["paddle"] for n in SKINS}) == len(SKINS)
     ok = ok and len({SKINS[n]["brick"] for n in SKINS}) == len(SKINS)
@@ -1137,7 +1184,7 @@ def run_selftest() -> int:
     ok = all(set(t) == {"ball", "paddle", "brick", "wall"} for t in THEMES.values())
     check("themes-valid", ok)
 
-    total = 17
+    total = 20
     print(f"\n{total - len(fails)}/{total} checks passed.")
     return 1 if fails else 0
 
